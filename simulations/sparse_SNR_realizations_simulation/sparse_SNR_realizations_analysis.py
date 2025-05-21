@@ -8,9 +8,9 @@ import glob
 import tkinter as tk
 import re
 from tkinter import filedialog
-from utils import *
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
+from utils.image_processing import compute_similarity_score
 
 
 def select_result_directory():

@@ -6,9 +6,13 @@ import matplotlib.pyplot as plt
 from torch.fft import *
 from torchvision.transforms import CenterCrop, Resize
 from matplotlib.colors import LinearSegmentedColormap
-from utils import *
-from utils import display_field
-from CTRCLASS import CTR_CLASS
+
+
+from core.CTRCLASS import CTR_CLASS
+from utils.visualization import display_field
+from utils.field_utils import generate_diffusers_and_PSFs, gauss2D
+from utils.io import load_file_to_tensor
+from utils.image_processing import fourier_convolution, shift_cross_correlation
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

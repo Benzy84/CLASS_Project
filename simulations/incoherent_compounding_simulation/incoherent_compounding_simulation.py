@@ -9,8 +9,12 @@ import numpy as np
 import os
 import datetime
 from torch.fft import *
-from utils import *
-from CTRCLASS import CTR_CLASS
+from core.CTRCLASS import CTR_CLASS
+from utils.field_utils import gauss2D, circ, generate_diffusers_and_PSFs
+from utils.image_processing import shift_cross_correlation, fourier_convolution
+from utils.io import load_file_to_tensor
+from utils.visualization import display_field
+
 from torchvision.transforms import CenterCrop, Resize
 from matplotlib.colors import LinearSegmentedColormap
 from diffractsim import MonochromaticField, mm, cm, um, set_backend
@@ -521,7 +525,6 @@ for k_idx, K in enumerate(K_values):
     np.save(os.path.join(results_dir, f"O_est_with_modulation_with_{K}_micro_frames.npy"), nrm(O_est_modulated).cpu().numpy())
 
     # convert macro_intensities to np.array
-    AAA = torch.stack(macro_intensities).cpu().numpy()
     np.save(os.path.join(results_dir, f"macro_intensities_with_{K}_micro_frames.npy"), torch.stack(macro_intensities).cpu().numpy())
     np.save(os.path.join(results_dir, f"macro_objects_fields_with_{K}_micro_frames.npy"), torch.stack(macro_obj_fields).cpu().numpy())
     np.save(os.path.join(results_dir, f"macro_objects_intesities_with_{K}_micro_frames.npy"), torch.stack(macro_obj_intensities).cpu().numpy())

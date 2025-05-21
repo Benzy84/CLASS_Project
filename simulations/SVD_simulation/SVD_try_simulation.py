@@ -9,13 +9,16 @@ import numpy as np
 import os
 import datetime
 from torch.fft import *
-from utils import *
-from CTRCLASS import CTR_CLASS
 from torchvision.transforms import CenterCrop
 from torchvision.transforms import Resize
 from matplotlib.colors import LinearSegmentedColormap
 
-
+from core.CTRCLASS import CTR_CLASS
+from simulations.simulation_utils import get_modulation_strategies
+from utils.field_utils import gauss2D
+from utils.io import load_mat_file, load_file_to_tensor, create_timestamped_dir
+from utils.image_processing import fourier_convolution, shift_cross_correlation
+from utils.field_utils import generate_diffusers_and_PSFs
 # Define the custom colormap
 def get_custom_colormap():
     # Define the colors for the colormap in RGB format
@@ -346,32 +349,20 @@ for trial in range(num_trials):
 
 
             # Run CLASS algorithm
-            _, _, phi_tot_mod, MTF_mod = CTR_CLASS(T_mod, num_iters=1000)
-            _, _, phi_tot_filt, MTF_filt = CTR_CLASS(T_filt, num_iters=1000)
+            _, _, phi_tot, MTF = CTR_CLASS(T_filt, num_iters=1000)
 
             # Raw reconstruction
-            O_raw_mod = ifft2(ifftshift(torch.conj(phi_tot_mod) * MTF_mod))
-            O_est_mod = shift_cross_correlation(widefield, O_raw_mod.real)
-            O_est_mod /= torch.abs(O_est_mod).max()
-
-            # Raw reconstruction
-            O_raw_filt = ifft2(ifftshift(torch.conj(phi_tot_filt) * MTF_filt))
-            O_est_filt = shift_cross_correlation(widefield, O_raw_filt.real)
-            O_est_filt /= torch.abs(O_est_filt).max()
+            O_raw = ifft2(ifftshift(torch.conj(phi_tot) * MTF))
+            O_est = shift_cross_correlation(widefield, O_raw.real)
+            O_est /= torch.abs(O_est).max()
 
 
-            img1 = O_est_mod
-            img1 -= torch.min(img1)
-            img1 = nrm(img1).cpu().numpy()
-
-            img2 = O_est_filt
+            img2 = O_est
             img2 -= torch.min(img2)
             img2 = nrm(img2).cpu().numpy()
 
-            plt.subplot(1, 2, 1)
-            plt.imshow(img1, cmap=new_cmap)
 
-            plt.subplot(1, 2, 2)
+            plt.figure()
             plt.imshow(img2, cmap=new_cmap)
 
             # Save raw results
@@ -401,4 +392,3 @@ savemat(f'{output_dir}/simulation_data.mat', {
 
 print(f"Simulation data collection completed. Results saved to: {output_dir}")
 print(f"Run the analysis script to analyze the collected data.")
-import modulation_depth_analysis

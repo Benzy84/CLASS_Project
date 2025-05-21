@@ -1,20 +1,18 @@
+import matplotlib as mpl
+mpl.use('TkAgg')
+import matplotlib.pyplot as plt
 import time
-
 import torch
 import numpy as np
 import os
 import datetime
-import matplotlib.pyplot as plt
-from scipy.fft import fftshift
-from torch.fft import *
-from torch.fft import fftshift
 from torchvision.transforms import CenterCrop, Resize
 from matplotlib.colors import LinearSegmentedColormap
-from utils import *
-from utils import display_field
-from CTRCLASS import CTR_CLASS
-from diffractsim import MonochromaticField, mm, cm, um, set_backend
-
+from core.CTRCLASS import CTR_CLASS
+from utils.field_utils import gauss2D, generate_diffusers_and_PSFs
+from utils.io import load_file_to_tensor
+from propagation.propagation import angular_spectrum_gpu
+from utils.image_processing import shift_cross_correlation, fourier_convolution
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -35,100 +33,6 @@ new_cmap = LinearSegmentedColormap.from_list('greenish_hot', list(zip(positions,
 
 # Helper functions
 nrm = lambda x: x / x.abs().max()
-
-def propagate_field(field_tensor, pixel_size, wavelength, distance, method='AS'):
-    """
-    Propagate a PyTorch tensor field using diffractsim.
-    Handles both single fields (2D tensor) and batches (3D tensor).
-
-    Parameters:
-    -----------
-    field_tensor : torch.Tensor
-        Complex field tensor on GPU. Can be 2D (single field) or 3D (batch of fields)
-    pixel_size : float
-        Pixel size in meters
-    wavelength : float
-        Wavelength in meters
-    distance : float
-        Propagation distance in meters
-    method : str, optional
-        Propagation method ('AS' for Angular Spectrum, 'fraunhofer' for Fraunhofer)
-
-    Returns:
-    --------
-    torch.Tensor
-        Propagated field(s) on the same device as the input tensor
-    """
-    # Save original device
-    device = field_tensor.device
-
-    # Check if this is a batch (3D tensor) or single field (2D tensor)
-    is_batch = len(field_tensor.shape) == 3
-
-    if is_batch:
-        # Process batch by looping through each field
-        batch_size = field_tensor.shape[0]
-        results = []
-
-        for i in range(batch_size):
-            # Extract single field
-            single_field = field_tensor[i]
-
-            # Convert to NumPy array
-            field_numpy = single_field.cpu().detach().numpy()
-
-            # Create MonochromaticField
-            F = MonochromaticField(
-                wavelength=wavelength,
-                extent_x=field_numpy.shape[1] * pixel_size,
-                extent_y=field_numpy.shape[0] * pixel_size,
-                Nx=field_numpy.shape[1],
-                Ny=field_numpy.shape[0]
-            )
-
-            # Set field data
-            F.E = field_numpy
-
-            # Propagate
-            if method.lower() == 'fraunhofer':
-                F.propagate(distance, method='fraunhofer')
-            else:
-                F.propagate(distance)  # Default is Angular Spectrum
-
-            # Convert back to PyTorch tensor and append
-            result_tensor = torch.tensor(F.E, dtype=torch.complex64).to(device)
-            results.append(result_tensor)
-
-        # Stack results to return a batch
-        return torch.stack(results)
-
-    else:
-        # Original single-field behavior
-        # Convert PyTorch tensor to NumPy array
-        field_numpy = field_tensor.cpu().detach().numpy()
-
-        # Create MonochromaticField
-        F = MonochromaticField(
-            wavelength=wavelength,
-            extent_x=field_numpy.shape[1] * pixel_size,
-            extent_y=field_numpy.shape[0] * pixel_size,
-            Nx=field_numpy.shape[1],
-            Ny=field_numpy.shape[0]
-        )
-
-        # Set field data
-        F.E = field_numpy
-
-        # Propagate
-        if method.lower() == 'fraunhofer':
-            F.propagate(distance, method='fraunhofer')
-        else:
-            F.propagate(distance)  # Default is Angular Spectrum
-
-        # Convert back to PyTorch tensor
-        result_tensor = torch.tensor(F.E, dtype=torch.complex64).to(device)
-        return result_tensor
-
 
 def makedir(directory):
     """Create directory if it doesn't exist"""
@@ -301,7 +205,7 @@ for i, spot_size in enumerate(spot_sizes):
 
     # _, PSF_std, obj_fourier_angle, obj_fourier_abs = CTR_CLASS(T, num_iters, imsize=shp)
     O_est_at_diff = torch.conj(phi_tot) * MTF
-    O_est_0 = propagate_field(O_est_at_diff, pixel_size_m, wavelength_m, -3e-2)
+    O_est_0 = angular_spectrum_gpu(O_est_at_diff, pixel_size_m, wavelength_m, -z)
 
 
     # O_est_0 = ifft2(ifftshift(torch.conj(phi_tot) * MTF))

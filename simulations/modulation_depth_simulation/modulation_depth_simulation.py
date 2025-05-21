@@ -9,11 +9,15 @@ import numpy as np
 import os
 import datetime
 from torch.fft import *
-from utils import *
-from CTRCLASS import CTR_CLASS
 from torchvision.transforms import CenterCrop
 from torchvision.transforms import Resize
 from matplotlib.colors import LinearSegmentedColormap
+
+from core.CTRCLASS import CTR_CLASS
+from simulations.simulation_utils import get_modulation_strategies
+from utils.io import create_timestamped_dir, load_mat_file, load_file_to_tensor
+from utils.field_utils import gauss2D, generate_diffusers_and_PSFs
+from utils.image_processing import shift_cross_correlation, fourier_convolution
 
 
 # Define the custom colormap
@@ -61,8 +65,6 @@ center_crop = CenterCrop(sz)
 pixel_size = 5  # Pixel size in microns
 speckle_size = 15  # Speckle size in microns
 theta = 1 # Angular spread in degrees
-theta = np.rad2deg(0.6328/35)
-theta = 1.25
 wavelength = 0.6328  # Wavelength in microns (632.8 nm)
 
 # Simulation experiment parameters
@@ -72,7 +74,7 @@ num_trials = 1  # Number of independent trials
 min_weight = 0 #0.01  # Minimum allowed weight to prevent zeros
 
 # Alpha values from 0 to 1
-depth_values = torch.linspace(0, 0.97, 11)
+depth_values = torch.linspace(0, 0.97, 3)
 # depth_values[3] = 1/3
 alpha_values = - (depth_values + 1) / (depth_values - 1)
 alpha_values = alpha_values.tolist()
@@ -272,22 +274,6 @@ for trial in range(num_trials):
     # Generate images through diffusers
     if not is_real_data:
         I = fourier_convolution(gt_Intensity, PSFs_normalized).abs()
-        num_pixels = sz ** 2
-
-        # Calculate the photon budget needed so that the average photon count per pixel gives the desired SNR
-        SNR = 10
-        N_photons = SNR ** 2 * num_pixels
-        I_counts = I * N_photons
-        I_noisy_counts = torch.poisson(I_counts)
-        I_noisy = I_noisy_counts / N_photons
-        if SNR == torch.inf:
-            I_noisy = I
-        # Rough local estimate over the whole image:
-        noise_std_est = (I_noisy[0] - I[0]).std()
-        mean_signal = I[0].mean()
-        estimated_SNR = mean_signal / noise_std_est
-        print('Estimated SNR:', estimated_SNR)
-
 
     # Save aberrated image example for reference
     np.save(f'{output_dir}/aberrated_image_trial_{trial + 1}.npy', I[0].cpu().numpy())
@@ -316,7 +302,7 @@ for trial in range(num_trials):
                 np.save(f'{output_dir}/modulation_{strategy_name}_alpha_{alpha:.2f}.npy', modulation.cpu().numpy())
 
             # Multiply each field by its corresponding weight
-            I_modulated = I_noisy * modulation[:, None, None]
+            I_modulated = I * modulation[:, None, None]
             I_modulated_mean_reduced = I_modulated - I_modulated.mean(0)
 
             # Compute Fourier transform of the images
@@ -350,21 +336,8 @@ for trial in range(num_trials):
             # Clear GPU memory
             torch.cuda.empty_cache()
         # plt.show()
-from scipy.io import savemat
-# Convert to NumPy
-gt_np = gt.cpu().numpy()
-I_np = I.cpu().numpy()        # shape: [M, H, W] or [H, W]
-I_noisy_np = I_noisy.cpu().numpy()
-widefield_np = widefield.cpu().numpy()
 
-# Save all three into one .mat
-savemat(f'{output_dir}/simulation_data.mat', {
-    'gt':        gt_np,
-    'I':         I_np,
-    'I_noisy':         I_noisy_np,
-    'widefield': widefield_np
-})
+
 
 print(f"Simulation data collection completed. Results saved to: {output_dir}")
 print(f"Run the analysis script to analyze the collected data.")
-import modulation_depth_analysis

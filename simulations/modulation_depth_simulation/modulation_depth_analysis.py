@@ -7,9 +7,8 @@ import re
 import tkinter as tk
 from tkinter import filedialog
 from matplotlib.colors import LinearSegmentedColormap
-from utils import *
-from utils import center_crop
-from utils import display_field
+from utils.image_processing import center_crop, compute_similarity_score
+from utils.visualization import display_field
 nrm = lambda x: x/np.abs(x).max()
 
 
@@ -58,13 +57,11 @@ def extract_params_from_readme(output_dir):
 
         # Extract parameters
         alpha_values = extract_param(readme_content, 'alpha_values')
-        depth_values = [np.round(((a - 1) / (a + 1)),3) for a in alpha_values]
         strategies = extract_param(readme_content, 'strategies')
         num_trials = int(extract_param(readme_content, 'num_trials')[0])
 
         return {
             'alpha_values': alpha_values,
-            'modulation_depth_values': depth_values,
             'strategies': strategies,
             'num_trials': num_trials
         }
@@ -169,13 +166,14 @@ def load_data_and_compute_scores(output_dir, ref_data, params):
         scores_dict[strategy] = {}
 
         for alpha in params['alpha_values']:
-            depth = np.round(((alpha-1)/(alpha+1)),3)
             alpha_str = f'{float(alpha):.2f}'
-            scores_dict[strategy][depth] = []
+            scores_dict[strategy][alpha] = []
 
             for trial in range(1, params['num_trials'] + 1):
                 # Load reconstruction
                 recon_file = os.path.join(output_dir, f'O_est_{strategy}_alpha_{alpha_str}_trial_{trial}.npy')
+                recon_step_file = os.path.join(output_dir, f'O_est_step_alpha_1.00_trial_1.npy')
+                recon_lr_file = os.path.join(output_dir, f'O_est_linear_ramp_alpha_1.00_trial_1.npy')
 
                 try:
                     # Load and normalize reconstruction
@@ -183,7 +181,7 @@ def load_data_and_compute_scores(output_dir, ref_data, params):
                     recon = recon / np.max(np.abs(recon))
 
                     score = compute_similarity_score(widefield, recon)
-                    scores_dict[strategy][depth].append(score)
+                    scores_dict[strategy][alpha].append(score)
 
                     processed += 1
                     if processed % 10 == 0 or processed == total_combinations:
@@ -193,9 +191,9 @@ def load_data_and_compute_scores(output_dir, ref_data, params):
                     print(f"File not found: {recon_file}")
 
             # Calculate average score for this strategy and alpha
-            if scores_dict[strategy][depth]:
-                avg_score = np.mean(scores_dict[strategy][depth])
-                scores_dict[strategy][depth].append(avg_score)
+            if scores_dict[strategy][alpha]:
+                avg_score = np.mean(scores_dict[strategy][alpha])
+                scores_dict[strategy][alpha].append(avg_score)
 
     return scores_dict
 
@@ -216,16 +214,16 @@ def find_best_alpha(scores_dict, strategy):
     best_score = -float('inf')
     best_alpha = None
 
-    for idx, depth in enumerate(scores_dict[strategy].keys()):
-        if scores_dict[strategy][depth]:
+    for alpha in scores_dict[strategy].keys():
+        if scores_dict[strategy][alpha]:
             # Get average score (last element in the list)
-            avg_score = scores_dict[strategy][depth][-1]
+            avg_score = scores_dict[strategy][alpha][-1]
 
             if avg_score > best_score:
                 best_score = avg_score
-                best_alpha_idx = idx
+                best_alpha = alpha
 
-    return best_alpha_idx, best_score
+    return best_alpha, best_score
 
 
 def load_reconstruction(output_dir, strategy, alpha, trial=1):
@@ -334,16 +332,16 @@ def plot_alpha_scores(scores_dict, strategy, ax=None):
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 4))
 
-    depths = sorted(scores_dict[strategy].keys())
+    alphas = sorted(scores_dict[strategy].keys())
     avg_scores = []
 
-    for depth in depths:
-        if scores_dict[strategy][depth]:
-            avg_scores.append(scores_dict[strategy][depth][-1])  # Last element is the average
+    for alpha in alphas:
+        if scores_dict[strategy][alpha]:
+            avg_scores.append(scores_dict[strategy][alpha][-1])  # Last element is the average
         else:
             avg_scores.append(np.nan)
 
-    ax.plot(depths, avg_scores, 'o-', linewidth=2, color='blue')
+    ax.plot(alphas, avg_scores, 'o-', linewidth=2, color='blue')
     ax.set_xlabel('Modulation Depth (α)')
     ax.set_ylabel('Average Score')
     ax.set_title(f'Score vs Alpha: {strategy}')
@@ -372,8 +370,7 @@ def create_strategy_figure(output_dir, ref_data, scores_dict, strategy, params):
     aberrated_img = ref_data.get('aberrated_img')
 
     # Find best alpha for this strategy
-    best_alpha_idx, best_score = find_best_alpha(scores_dict, strategy)
-    best_alpha = params['alpha_values'][best_alpha_idx]
+    best_alpha, best_score = find_best_alpha(scores_dict, strategy)
     if best_alpha is None:
         print(f"No valid scores found for strategy: {strategy}")
         return None
@@ -386,49 +383,19 @@ def create_strategy_figure(output_dir, ref_data, scores_dict, strategy, params):
         return None
 
     alphas = params['alpha_values']
-    depths = params['modulation_depth_values']
     # alphas = alphas[::2]
-    plt.figure(figsize=(18, 9))
+    plt.figure()
     for idx, alpha in enumerate(alphas):
-        depth = depths[idx]
         img = load_reconstruction(output_dir, strategy, alpha)
         img -= np.min(img)
         img = nrm(img)
-        score = np.round(scores_dict[strategy][depth][-1], 4)
+        score = np.round(scores_dict[strategy][alpha][-1], 4)
         plt.subplot(2,7, idx+1)
         plt.imshow(img, cmap=new_cmap)
         if idx == 0:
             plt.colorbar()
         plt.title(f'score:{score}')
-    save_path = os.path.join(output_dir, 'All reconstructions.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Saved figure to {save_path}")
     plt.show()
-
-
-    plt.figure()
-    img1 = center_crop(cl_no_noise_img,127)
-    img2 = center_crop(cl_img,127)
-    img3 = pr_no_noise_img
-    img4 = pr2_img
-    plt.subplot(2,2, 1)
-    plt.imshow(img1, cmap=new_cmap)
-    plt.title(f'CLASS no noise')
-
-    plt.subplot(2,2, 2)
-    plt.imshow(img2, cmap=new_cmap)
-    plt.title(f'CLASS SNR=70')
-
-    plt.subplot(2,2, 3)
-    plt.imshow(img3, cmap=new_cmap)
-    plt.title(f'PR no noise')
-
-    plt.subplot(2,2, 4)
-    plt.imshow(img4, cmap=new_cmap)
-    plt.title('PR_SNR=70')
-    plt.show()
-
-
 
 
     # Create figure
@@ -471,7 +438,7 @@ def create_strategy_figure(output_dir, ref_data, scores_dict, strategy, params):
     plt.colorbar(im4)
     plt.axis('off')
 
-    # Scores vs modulation depth
+    # Scores vs Alpha
     ax5 = plt.subplot(2, 3, 5)
     plot_alpha_scores(scores_dict, strategy, ax=ax5)
 
@@ -506,8 +473,7 @@ def find_all_best_reconstructions(output_dir, scores_dict, params):
     best_alphas = {}
 
     for strategy in params['strategies']:
-        best_alpha_idx, best_score = find_best_alpha(scores_dict, strategy)
-        best_alpha = params['alpha_values'][best_alpha_idx]
+        best_alpha, best_score = find_best_alpha(scores_dict, strategy)
         if best_alpha is not None:
             best_recon = load_reconstruction(output_dir, strategy, best_alpha)
             best_recon -= np.min(best_recon)
@@ -655,10 +621,10 @@ def main():
     print("\nScore Summary:")
     for strategy in scores_dict:
         print(f"\nStrategy: {strategy}")
-        for depth in sorted(scores_dict[strategy].keys()):
-            if scores_dict[strategy][depth]:
-                avg_score = scores_dict[strategy][depth][-1]  # Last element is the average
-                print(f"  Modulation depth = {depth:.2f}: Average score = {avg_score:.4f}")
+        for alpha in sorted(scores_dict[strategy].keys()):
+            if scores_dict[strategy][alpha]:
+                avg_score = scores_dict[strategy][alpha][-1]  # Last element is the average
+                print(f"  Alpha={alpha:.2f}: Average score={avg_score:.4f}")
 
     # Run analysis and create all plots
     analyze_and_plot_all(output_dir, ref_data, scores_dict, params)

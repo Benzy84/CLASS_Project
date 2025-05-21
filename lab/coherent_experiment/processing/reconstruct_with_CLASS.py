@@ -2,17 +2,16 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 import os
-from CTRCLASS import CTR_CLASS
 from torch.fft import *
 from tkinter import filedialog
 import matplotlib
 from scipy.io import savemat
 import h5py
-import numpy as np
 import scipy.io as sio
 
 
 
+from core.CTRCLASS import CTR_CLASS
 
 
 import torch.nn.functional as F

@@ -3,6 +3,7 @@ import torch
 import tkinter as tk
 from tkinter import filedialog, messagebox, Toplevel, Button, Label
 from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
 import mat73
 import glob
 import datetime

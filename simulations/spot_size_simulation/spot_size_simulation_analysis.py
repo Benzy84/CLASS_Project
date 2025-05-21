@@ -5,8 +5,8 @@ import numpy as np
 import os
 import tkinter as tk
 from tkinter import filedialog
-from utils import display_field, center_crop
-from utils import *
+from utils.visualization import display_field
+from utils.image_processing import center_crop
 from matplotlib.pyplot import imshow
 
 nrm = lambda x: x/np.abs(x).max()
