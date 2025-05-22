@@ -1,368 +1,281 @@
-import numpy as np
+import matplotlib
+
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from matplotlib.animation import PillowWriter
-from matplotlib import transforms
-import matplotlib.patches as patches
+import numpy as np
+import torch
 
-def phplot(field, amp=1):
+from torchvision.transforms.functional import rotate, center_crop
+from utils.io import load_file_to_tensor
+from utils.field_utils import generate_diffusers_and_PSFs
+from propagation.propagation import angular_spectrum_gpu
+from utils.image_processing import resize, center_crop, shift_cross_correlation, nrm, compute_similarity_score
+from core.CTRCLASS import CTR_CLASS
+from utils.visualization import display_field, get_custom_colormap
+from torch.fft import fft2, ifft2, fftshift, ifftshift
+from skimage.transform import warp_polar
+from skimage.registration import phase_cross_correlation
+
+
+
+def rescale_complex_field(field, scale):
+    """Rescales a complex field by a given scale factor."""
+    return field * scale
+
+def find_best_scaling_by_intensity_alignment(field, ref_intensity, candidate_dz, size, pixel_size, wavelength):
+    """Find the best scaling factor and propagation distance for field alignment."""
+    field_intensity = torch.abs(field)**2
+    field_intensity_np = field_intensity.cpu().numpy()
+    
+    best_score = -np.inf
+    best_scale = 1.0
+    best_dz = 0.0
+    
+    for dz in candidate_dz:
+        # Estimate scale using intensity ratio
     """
-    Implementation of phplot for phase visualization
+    Show a sequence of 2D fields (real or complex) as an animation in the console.
+
+    Parameters:
+    -----------
+    fields : np.ndarray or torch.Tensor
+        A 3D array of shape (M, N, N) with complex or real values.
+    fps : int
+        Frames per second for animation speed.
     """
-    # Calculate phase and amplitude with log scaling
-    phase = np.unwrap(np.angle(field))
-    amplitude = np.log(np.abs(field) + 1)  # Added logarithmic scaling
-
-    if amp != 0:
-        # Add check for zero maximum
-        max_amp = np.max(amplitude)
-        if max_amp > 0:
-            amplitude = amplitude / max_amp  # Normalize after log scaling
-        else:
-            amplitude = np.zeros_like(amplitude)
-    else:
-        amplitude = np.ones_like(amplitude)
-
-    # Normalize phase to [0, 2π] range after unwrapping
-    phase_min = np.min(phase)
-    phase_max = np.max(phase)
-    if phase_max > phase_min:
-        phase = (phase - phase_min) / (phase_max - phase_min) * 2 * np.pi
-    else:
-        phase = np.zeros_like(phase)
-
-    # Handle any remaining NaN values
-    amplitude = np.nan_to_num(amplitude)
-    phase = np.nan_to_num(phase)
-
-    # Create RGB array
-    A = np.zeros((*field.shape, 3))
-
-    # Map phase to RGB using trigonometric functions
-    A[..., 0] = 0.5 * (np.sin(phase) + 1) * amplitude  # Red
-    A[..., 1] = 0.5 * (np.sin(phase + np.pi/2) + 1) * amplitude  # Green
-    A[..., 2] = 0.5 * (-np.sin(phase) + 1) * amplitude  # Blue
-
-    # Ensure values are in valid range
-    A = np.clip(A, 0, 1)
-
-    return A
-
-def apply_lpf(image, sigma=2.0):
-    """
-    Apply Gaussian Low Pass Filter to image
-    """
-    rows, cols = image.shape
-    crow, ccol = rows // 2, cols // 2
-
-    y, x = np.ogrid[-crow:rows - crow, -ccol:cols - ccol]
-    mask = np.exp(-(x * x + y * y) / (2.0 * sigma * sigma))
-
-    f = np.fft.fft2(image)
-    fshift = np.fft.fftshift(f)
-
-    filtered_fshift = fshift * mask
-    filtered_f = np.fft.ifftshift(filtered_fshift)
-    filtered_image = np.real(np.fft.ifft2(filtered_f))
-
-    # Add checks for invalid values
-    min_val = np.nanmin(filtered_image)
-    max_val = np.nanmax(filtered_image)
-
-    if max_val == min_val:
-        filtered_image = np.zeros_like(filtered_image)
-    else:
-        filtered_image = (filtered_image - min_val) / (max_val - min_val)
-
-    # Ensure no NaN values
-    filtered_image = np.nan_to_num(filtered_image)
-
-    return filtered_image
-
-def create_frames(num_frames, width=500, height=500):
-    frames = []  # frames with road (for display)
-    frames_car_only = []  # frames without road (for FFT)
-    ffts = []  # Store FFT data directly
-
-    # Create base figure for rendering
-    fig = plt.figure(figsize=(width / 100, height / 100))
-    ax = plt.gca()
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, 5)
-    ax.set_axis_off()
-
-    # Road polygon points
-    road_points = np.array([
-        [1, 0],  # Bottom left
-        [9, 0],  # Bottom right
-        [6.5, 5],  # Top right
-        [3.5, 5],  # Top left
-        [1, 0]  # Close polygon
-    ])
-
-    # Car initial properties
-    car_width = 2.0
-    car_height = 1.2
-    car_x = 4.0
-
-    for frame_number in range(num_frames):
-        # Generate two frames for each iteration
-        for include_road in [True, False]:
-            ax.clear()
-            ax.set_xlim(0, 10)
-            ax.set_ylim(0, 5)
-            ax.set_axis_off()
-
-            # Draw road only if include_road is True
-            if include_road:
-                road = plt.Polygon(road_points, color='gray', zorder=1)
-                ax.add_patch(road)
-
-            # Calculate position and scale for current frame
-            progress = frame_number / num_frames
-            start_x, start_y = car_x, 0.5
-            end_x, end_y = 5.0, 4.5
-            current_x = start_x + (end_x - start_x) * progress
-            current_y = start_y + (end_y - start_y) * progress
-            scale = 1.0 - (0.9 * progress)
-
-            # Create and transform car parts
-            t = (transforms.Affine2D()
-                 .translate(-car_x, -0.5)
-                 .scale(scale)
-                 .translate(current_x, current_y))
-
-            # Car body
-            car_body = patches.Rectangle((car_x, 0.5), car_width, car_height,
-                                         color="blue", zorder=2)
-            car_body.set_transform(t + ax.transData)
-            ax.add_patch(car_body)
-
-            # Wheels
-            wheel_width, wheel_height = 0.08, 0.25
-            wheel1 = patches.Ellipse((car_x + 0.2, 0.5), wheel_width, wheel_height,
-                                     color="black", zorder=2)
-            wheel2 = patches.Ellipse((car_x + car_width - 0.2, 0.5), wheel_width,
-                                     wheel_height, color="black", zorder=2)
-            wheel1.set_transform(t + ax.transData)
-            wheel2.set_transform(t + ax.transData)
-            ax.add_patch(wheel1)
-            ax.add_patch(wheel2)
-
-            # Window
-            window_width = car_width * 0.7
-            window_height = car_height * 0.7
-            window_x = car_x + (car_width - window_width) / 2
-            window_y = 0.5 + (car_height - window_height) / 2
-            rear_window = patches.Rectangle((window_x, window_y), window_width,
-                                            window_height, color="lightblue", zorder=3)
-            rear_window.set_transform(t + ax.transData)
-            ax.add_patch(rear_window)
-
-            # Render frame to array
-            fig.canvas.draw()
-            buf = fig.canvas.buffer_rgba()
-            image = np.asarray(buf)
-            image = image[:, :, :3]
-
-            # Convert to grayscale and normalize
-            frame = np.mean(image, axis=2) / 255.0
-
-            if include_road:
-                frames.append(frame)
-            else:
-                frames_car_only.append(frame)
-                # Calculate FFT only for car-only frame
-                fft = np.fft.fftshift(np.fft.fft2(frame))
-                ffts.append(fft)
-
-    plt.close(fig)
-    return np.array(frames), np.array(ffts)
-def save_single_animation(frames_array,  filename, title='No title', fps=20):
-    """
-    Save a combined animation with original and FFT visualization side by side
-    """
-    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
-
-    # Initialize images
-    img = ax.imshow(frames_array[0], cmap='gray')
-
-    # Set titles
-    ax.set_title(title)
-
-    # Turn off axes
-    ax.axis('off')
-
-    plt.tight_layout()
-
-    def update(frame):
-        img.set_array(frames[frame])
-        return [img]
-
-    # Create and save animation
-    ani = FuncAnimation(fig, update, frames=len(frames),
-                       interval=50, blit=True)
-    ani.save(filename, writer=PillowWriter(fps=fps))
-    plt.close(fig)
-
-def save_combined_animation(frames, ffts, filename, fps=20):
-    """
-    Save a combined animation with original and FFT visualization side by side
-    """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
-
-    # Initialize images
-    img1 = ax1.imshow(frames[0], cmap='gray')
-    img2 = ax2.imshow(phplot(ffts[0]))
-
-    # Set titles
-    ax1.set_title('Original')
-    ax2.set_title('FFT Phase (phplot)')
-
-    # Turn off axes
-    ax1.axis('off')
-    ax2.axis('off')
-
-    plt.tight_layout()
-
-    def update(frame):
-        img1.set_array(frames[frame])
-        img2.set_array(phplot(ffts[frame]))
-        return img1, img2
-
-    # Create and save animation
-    ani = FuncAnimation(fig, update, frames=len(frames),
-                       interval=50, blit=True)
-    ani.save(filename, writer=PillowWriter(fps=fps))
-    plt.close(fig)
-
-def save_combined_mag_plot_animation(frames, ffts, filename, fps=20):
-    """
-    Save animation with original and FFT magnitude visualizations
-    """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
-
-    # Initialize images
-    frame = frames[0]
-    magnitude = np.log(np.abs(ffts[0]) + 1)
-
-    img1 = ax1.imshow(frame, cmap='gray')
-    img2 = ax2.imshow(magnitude, cmap='gray')
-
-    # Set titles
-    ax1.set_title('Original')
-    ax2.set_title('FFT Magnitude (log scale)')
-
-    # Turn off axes
-    ax1.axis('off')
-    ax2.axis('off')
-
-    plt.tight_layout()
-
-    def update(frame_idx):  # Changed parameter name to frame_idx
-        frame = frames[frame_idx]  # Use frame_idx for indexing
-        magnitude = np.log(np.abs(ffts[frame_idx]) + 1)  # Use frame_idx for indexing
-
-        img1.set_array(frame)
-        img2.set_array(magnitude)
-        return img1, img2
-
-    # Create and save animation
-    ani = FuncAnimation(fig, update, frames=len(frames),
-                        interval=50, blit=True)
-    ani.save(filename, writer=PillowWriter(fps=fps))
-    plt.close(fig)
-
-def save_triple_animation(frames, ffts, filename, fps=20):
-    """
-    Save animation with original, FFT magnitude, and FFT phase visualizations
-    """
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-
-    # Initialize images
-    frame = frames[0]
-    magnitude = np.log(np.abs(ffts[0]) + 1)
-    phase = np.unwrap(np.angle(ffts[0]))
-
-    img1 = ax1.imshow(frame, cmap='gray')
-    img2 = ax2.imshow(magnitude, cmap='viridis')
-    img3 = ax3.imshow(phase, cmap='hsv')
-
-    # Set titles
-    ax1.set_title('Original')
-    ax2.set_title('FFT Magnitude (log scale)')
-    ax3.set_title('FFT Phase')
-
-    # Turn off axes
-    ax1.axis('off')
-    ax2.axis('off')
-    ax3.axis('off')
-
-    plt.tight_layout()
-
-    def update(frame_idx):  # Changed parameter name to frame_idx
-        frame = frames[frame_idx]  # Use frame_idx for indexing
-        magnitude = np.log(np.abs(ffts[frame_idx]) + 1)  # Use frame_idx for indexing
-        phase = np.unwrap(np.angle(ffts[frame_idx]))  # Use frame_idx for indexing
-
-        img1.set_array(frame)
-        img2.set_array(magnitude)
-        img3.set_array(phase)
-        return img1, img2, img3
-
-    # Create and save animation
-    ani = FuncAnimation(fig, update, frames=len(frames),
-                        interval=50, blit=True)
-    ani.save(filename, writer=PillowWriter(fps=fps))
-    plt.close(fig)
-
-def init():
-    return img1, img2
-
-def update(frame_idx):
-    from time import time
-    start = time()
-
-    img1.set_array(frames[frame_idx])
-    img2.set_array(np.log(np.abs(ffts[frame_idx])+1))
-    img3.set_array(np.unwrap(np.angle(ffts[frame_idx])))
-
-    print(f"Frame: {frame_idx}, Time taken: {(time() - start) * 1000:.1f}ms")
-    return img1, img2, img3
-
-# Generate frames
-num_frames = 45
-frames, ffts = create_frames(num_frames)
-
-# Save combined synchronized animation
-# save_single_animation(frames,  'single_animation_closer_farther.gif', title='Amp', fps=20)
-# save_combined_animation(frames, ffts, 'combined_animation_closer_farther.gif', fps=10)
-save_combined_mag_plot_animation(frames, ffts, 'combined_animation_closer_farther.gif', fps=15)
-# save_triple_animation(frames, ffts, 'combined_animation_closer_farther_triple_view.gif', fps=10)
-
-# Setup figure for live visualization
-fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-
-# Initialize empty images
-img1 = ax1.imshow(frames[0], cmap='gray')
-img2 = ax2.imshow(np.log(np.abs(ffts[0])+1))
-img3 = ax3.imshow(np.unwrap(np.angle(ffts[0])))
-
-# Set titles
-ax1.set_title('Original')
-ax2.set_title('FFT Amplidude')
-ax3.set_title('FFT Phase')
-
-# Turn off axes
-ax1.axis('off')
-ax2.axis('off')
-ax3.axis('off')
-
-plt.tight_layout()
-
-# Create animation
-ani = FuncAnimation(fig, update, frames=num_frames,
-                   init_func=init, blit=True,
-                   interval=50)
+    # Convert torch tensor to numpy
+    if isinstance(fields, torch.Tensor):
+        fields = fields.detach().cpu().numpy()
+
+    # Ensure it's 3D
+    assert fields.ndim == 3, "Input must be of shape (M, N, N)"
+
+    M = fields.shape[0]
+
+    # Convert to complex if real
+    if np.isrealobj(fields):
+        fields = fields.astype(np.complex64)
+
+    abs_fields = np.abs(fields)
+    phase_fields = np.angle(fields)
+
+    # Prepare the plot
+    plt.ion()
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    im1 = axes[0].imshow(abs_fields[0], cmap='gray')
+    axes[0].set_title("Amplitude")
+    im2 = axes[1].imshow(phase_fields[0], cmap='twilight', vmin=-np.pi, vmax=np.pi)
+    axes[1].set_title("Phase")
+
+    for i in range(M):
+        im1.set_data(abs_fields[i])
+        im2.set_data(phase_fields[i])
+        fig.suptitle(f'Frame {i + 1}/{M}')
+        plt.pause(1.0 / fps)
+
+    plt.ioff()
+    plt.show()
+
+
+
+# parameters
+obj_size = 80
+pixel_size_m = 5e-6
+speckle_size_m = 15e-6  # Speckle size in meters
+wavelength_m = 0.6328e-6 # (632.8 nm)
+theta_deg = 0.5
+M = 180  # Number of realizations
+z_m = 4e-2
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+image = load_file_to_tensor()
+image = resize(image, obj_size).to(device)
+field = image#*torch.exp(1j*image)
+
+h, w = field.shape[:2]
+# Pre-pad the image to
+pad_h = int(1.5 * h)
+pad_w = int(1.5*w)
+
+padded_field = torch.nn.functional.pad(field, (pad_w, pad_w, pad_h, pad_h))
+padded_size = padded_field.shape[0]
+
+clean_diffuser, clean_PSF = generate_diffusers_and_PSFs(padded_size, 0 ,speckle_size_m ,pixel_size_m, wavelength_m, 1)
+image_at_diffuser_plane = angular_spectrum_gpu(padded_field, pixel_size_m, wavelength_m, z_m) * clean_diffuser.to(device)
+widefield = angular_spectrum_gpu(image_at_diffuser_plane, pixel_size_m, wavelength_m, -z_m)
+
+shifts_z = np.random.uniform(-0.5e-2, 0.5e-2, size=M)
+
+shifts_z[0] = 0
+print(f"X range:  {100 *shifts_z.min()} to {100 * shifts_z.max()} cm")
+shifted_frames = torch.zeros((M, padded_size, padded_size), dtype=torch.complex64, device=device)
+for idx in range(M):
+    current_shift = shifts_z[idx]
+    z_to_propagate = current_shift + z_m
+    shifted_frame = angular_spectrum_gpu(padded_field, pixel_size_m, wavelength_m, z_to_propagate)
+    shifted_frames[idx] = shifted_frame
+
+# img1 = shifted_frames[13].abs().cpu()
+# img2 = shifted_frames[5].abs().cpu()
+#
+# plt.figure()
+# plt.subplot(121)
+# plt.imshow(img1)
+# plt.subplot(122)
+# plt.imshow(img2)
+# plt.show()
+# show_fields_gif(shifted_frames, fps=40)
+# show_fields_gif(fftshift(fft2(shifted_frames)), fps=3)
+
+
+shifted_at_diffuser_plane = shifted_frames
+diffusers, PSFs = generate_diffusers_and_PSFs(padded_size,theta_deg,speckle_size_m,pixel_size_m, wavelength_m, M)
+distorted_at_diffuser_plane = diffusers.to(device) * shifted_at_diffuser_plane
+#
+# show_fields_gif(distorted_at_diffuser_plane, fps=20)
+#
+aligned_distorted_at_diffuser_plane = torch.zeros((M, padded_size, padded_size), dtype=torch.complex64, device=device)
+
+# Define candidate ∆z range to scan (in meters)
+candidate_dz = np.linspace(-1e-2, 1e-2, 201)  # e.g., -1 cm to +1 cm, 0.1 mm steps
+
+ref_intensity = torch.abs(distorted_at_diffuser_plane[0])**2
+ref_intensity_np = ref_intensity.cpu().numpy()
+
+for idx in range(M):
+    field = distorted_at_diffuser_plane[idx]
+    best_scale, best_dz = find_best_scaling_by_intensity_alignment(
+        field, ref_intensity_np, candidate_dz, padded_size, pixel_size_m, wavelength_m
+    )
+
+    scaled_field = rescale_complex_field(field, best_scale)
+    aligned_distorted_at_diffuser_plane[idx] = scaled_field
+
+    print(f"Frame {idx:3d}: best ∆z = {best_dz*1e3:+.2f} mm, scale = {best_scale:.5f}")
+
+
+reference_frame = torch.abs(distorted_at_diffuser_plane[0])
+# Reference intensity for scale estimation
+reference_intensity = torch.abs(distorted_at_diffuser_plane[0]).cpu().numpy()
+
+for idx in range(M):
+    current_field = distorted_at_diffuser_plane[idx]
+    current_intensity = torch.abs(current_field).cpu().numpy()
+
+    # Estimate relative scale w.r.t. frame 0
+    
+
+    # Apply scaling to the complex field
+    # scaled_field = ...
+
+    aligned_distorted_at_diffuser_plane[idx] = scaled_field
+
+    print(f"Frame {idx}: estimated scale = {scale:.5f}")
+
+
+show_fields_gif(aligned_distorted_at_diffuser_plane, fps=10)
+
+
+cropping_size = padded_size
+cropped_aligned_distorted_at_diffuser_plane = center_crop(aligned_distorted_at_diffuser_plane, cropping_size)
+cropped_distorted_at_diffuser_plane = center_crop(distorted_at_diffuser_plane, cropping_size)
+# show_fields_gif(cropped_aligned_distorted_at_diffuser_plane, fps=30)
+# Prepare for CLASS reconstruction
+T = torch.permute(distorted_at_diffuser_plane, [2, 1, 0]).reshape(cropping_size ** 2, -1)
+T_orig = torch.permute(cropped_distorted_at_diffuser_plane, [2, 1, 0]).reshape(cropping_size ** 2, -1)
+T = T.to(device)
+T_orig = T_orig.to(device)
+
+# Run CLASS algorithm
+_, _, phi_tot, MTF = CTR_CLASS(T, num_iters=1000)
+_, _, phi_tot_orig, MTF_orig = CTR_CLASS(T_orig, num_iters=1000)
+
+O_est_at_diff = torch.conj(phi_tot) * MTF
+O_est_0 = angular_spectrum_gpu(O_est_at_diff, pixel_size_m, wavelength_m, -z_m)
+O_est = shift_cross_correlation(center_crop(widefield,cropping_size), O_est_0).cpu().numpy()
+O_est = O_est / np.abs(O_est).max()
+
+O_est_at_diff_orig = torch.conj(phi_tot_orig) * MTF_orig
+O_est_0_orig = angular_spectrum_gpu(O_est_at_diff_orig, pixel_size_m, wavelength_m, -z_m)
+O_est_orig = shift_cross_correlation(center_crop(widefield,cropping_size), O_est_0_orig).cpu().numpy()
+O_est_orig = O_est_orig / np.abs(O_est_orig).max()
+
+z_values = np.linspace(0.5 * z_m, 2 * z_m, 100)
+propagated_Os = torch.zeros((100, cropping_size, cropping_size), dtype=torch.complex64, device=device)
+std = 0
+for idx, z_val in enumerate(z_values):
+    propagated_Os[idx] = angular_spectrum_gpu(O_est_at_diff, pixel_size_m, wavelength_m, -z_val)
+    if torch.std((propagated_Os[idx])) > std:
+        std = torch.std((propagated_Os[idx]))
+        best_idx = idx
+
+show_fields_gif(propagated_Os, 10)
+
+# display_field(propagated_Os[best_idx])
+
+
+new_camp = get_custom_colormap()
+
+plt.figure()
+idx = M//3
+plt.subplot(261)
+img = widefield.to(torch.complex64) if not torch.is_complex(widefield) else widefield
+img = img.cpu()
+plt.imshow(nrm(torch.abs(img)), cmap=new_camp, vmin=0, vmax=1)
+plt.title(f'widefield - magnitude')
+
+plt.subplot(267)
+plt.imshow(torch.angle(img), cmap='hsv')
+plt.title(f'widfeield - Phase')
+
+plt.subplot(262)
+img = diffusers[idx]
+img = img.cpu()
+plt.imshow(nrm(torch.abs(img)), cmap='gray', vmin=0, vmax=1)
+plt.title(f'diffuser - magnitude')
+
+plt.subplot(268)
+plt.imshow(torch.angle(img), cmap='hsv')
+plt.title(f'diffuser - Phase')
+
+plt.subplot(263)
+img = distorted_at_diffuser_plane[idx]
+img = img.cpu()
+plt.imshow(nrm(torch.abs(img)), cmap=new_camp, vmin=0, vmax=1)
+plt.title(f'distorted (at diff) - mag')
+
+plt.subplot(269)
+plt.imshow(torch.angle(img), cmap='hsv')
+plt.title(f'distorted (at diff) - Phase')
+
+plt.subplot(264)
+img = angular_spectrum_gpu(distorted_at_diffuser_plane[idx], pixel_size_m,wavelength_m, -z_m)
+img = img.cpu()
+plt.imshow(nrm(torch.abs(img)), cmap=new_camp, vmin=0, vmax=1)
+plt.title(f'distorted (at obj) - mag')
+
+plt.subplot(2,6,10)
+plt.imshow(torch.angle(img), cmap='hsv')
+plt.title(f'distorted (at obj) - Phase')
+
+plt.subplot(2,6,5)
+img = O_est_orig
+plt.imshow(nrm(np.abs(img)), cmap=new_camp, vmin=0, vmax=1)
+plt.title(f'reconstructed - mag \n no alignment')
+
+plt.subplot(2,6,11)
+plt.imshow(np.angle(img), cmap='hsv')
+plt.title(f'reconstructed - Phase\n no alignment')
+
+plt.subplot(2,6,6)
+img = O_est
+plt.imshow(nrm(np.abs(img)), cmap=new_camp, vmin=0, vmax=1)
+plt.title(f'reconstructed - mag')
+
+plt.subplot(2,6,12)
+plt.imshow(np.angle(img), cmap='hsv')
+plt.title(f'reconstructed - Phase')
 
 plt.show()
+
