@@ -179,6 +179,104 @@ def apply_zoom_to_complex_field(field, scale):
         )
 
 
+def align_via_fourier_magnitude(field, ref_field):
+    """
+    Align fields by matching their Fourier magnitude profiles.
+    Magnification in real space appears as radial scaling in Fourier space.
+    """
+    # Get Fourier transforms
+    F_field = fftshift(fft2(field))
+    F_ref = fftshift(fft2(ref_field))
+
+    # Work with log-magnitude to enhance features
+    mag_field = torch.log(torch.abs(F_field) + 1)
+    mag_ref = torch.log(torch.abs(F_ref) + 1)
+
+    # Radial average to get 1D profile
+    def radial_profile(image):
+        h, w = image.shape
+        center = (h // 2, w // 2)
+        Y, X = torch.meshgrid(torch.arange(h), torch.arange(w))
+        R = torch.sqrt((X - center[1]) ** 2 + (Y - center[0]) ** 2)
+
+        # Bin the radii
+        max_r = int(torch.max(R))
+        profile = torch.zeros(max_r)
+        for r in range(max_r):
+            mask = (R >= r) & (R < r + 1)
+            if mask.any():
+                profile[r] = image[mask].mean()
+        return profile
+
+    profile_field = radial_profile(mag_field)
+    profile_ref = radial_profile(mag_ref)
+
+    # Find scale by matching profiles...
+    # Then apply inverse scaling in Fourier domain
+
+
+def estimate_scale_from_speckle_statistics(field_intensity, ref_intensity):
+    """
+    Estimate scale from speckle grain size rather than direct intensity matching.
+    """
+
+    # Compute autocorrelation of both patterns
+    def autocorrelation(img):
+        F = fft2(img)
+        return ifft2(F * torch.conj(F)).real
+
+    acf_field = autocorrelation(field_intensity)
+    acf_ref = autocorrelation(ref_intensity)
+
+    # The width of the autocorrelation peak tells us the speckle size
+    # which scales with magnification
+    # Measure the width at half maximum...
+
+
+def phase_gradient_alignment(field, ref_field):
+    """
+    Use phase gradients which are less sensitive to random phase but
+    still contain scale information.
+    """
+
+    # Compute phase gradients
+    def phase_gradient(f):
+        phase = torch.angle(f)
+        dy, dx = torch.gradient(phase)
+        return torch.sqrt(dx ** 2 + dy ** 2)
+
+    grad_field = phase_gradient(field)
+    grad_ref = phase_gradient(ref_field)
+
+    # These gradients should have similar patterns but different scales
+
+
+def optimize_scale(field, ref_intensity, num_iterations=100):
+    """
+    Use gradient descent to find optimal scale.
+    """
+    scale = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.Adam([scale], lr=0.01)
+
+    for _ in range(num_iterations):
+        # Apply scale
+        scaled_field = apply_scale_in_fourier(field, scale)
+
+        # Loss
+        loss = -compute_similarity_score(torch.abs(scaled_field) ** 2, ref_intensity)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    return scale.item()
+
+def warp_field_registration(field, ref_field):
+    """
+    Use optical flow or similar to find warping between patterns.
+    """
+    # This could use cv2.calcOpticalFlowFarneback or similar
+    # on the intensity patterns
 
 # parameters
 obj_size = 80
