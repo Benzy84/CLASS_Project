@@ -17,7 +17,19 @@ from skimage.transform import warp_polar
 from skimage.registration import phase_cross_correlation
 
 
+'''
+Hi Claude,
+You already have access to my simulation project, including cases where the object moves laterally (in the x-y plane) or rotates. In those cases, I handled the misalignment by detecting the motion (via cross-correlation) and then applying inverse geometric transforms directly on the complex fields at the diffuser plane. This worked well and preserved the phase structure needed for the CLASS algorithm.
+Now I'm simulating a new case (closer_farther) where the object shifts slightly along the z-axis between frames — that is, each realization has the object located at a different axial distance before the diffuser. As before, the object field is propagated using the Angular Spectrum Method (ASM) to the diffuser plane. Then, I multiply the propagated field by a different random phase diffuser for each frame.
+The problem is this: in the CLASS algorithm, the assumption is that the object is fixed, and the per-frame variation comes only from the phase distortions (like different diffuser patterns). But in this axial case, the object changes between frames due to the z-shift, and this breaks the CLASS model. I can't fix this by propagating the field back or forward, because the diffuser has already applied an unknown, random phase. So the axial deformation is baked into the data.
+What I'm trying to do is find a way to normalize or correct for the axial shift — ideally making the object look effectively the same in all frames, so I can still use CLASS as-is.
+I know all the physical parameters (wavelength, pixel size, field size, etc.), and I can define a range of possible axial shifts to scan over. I tried estimating radial magnification from intensity images, and even using Fresnel scaling models to rescale the complex fields accordingly — but this didn’t help. The speckle patterns are too dominant, and rescaling the complex field just introduces new distortions.
+So I’m stuck: I can’t undo the propagation after the diffuser, and I can’t accurately rescale or align the fields just from intensity similarity. But the phase distortions caused by the diffuser are acceptable to CLASS — the only problem is the variation in the object itself.
+Can you help me come up with a method to preprocess the complex fields in a way that approximates a fixed objects intesites on the diffuser?  Ideally, the solution should only operate on the complex fields at the diffuser plane (that’s all I have), and not assume knowledge of the true z-position per frame.
 
+I suggested maybe not estimating Deltaz at all since we can not propagate it after we have it multiplied by the diffuser phase, but just take some reference intesity frame. frame [0], and scale all frames to this frame (zoom in \out or cut and resize), without knowing its z posizion. now after scaling the intensities will bee close to be identical, no? and the phase will be different, but it will be like this also because of the diffuser, so the algorithm will fix the phases already, as it is a part of the different diffusers, yes? in the rescaling I just do not know if we will just rescale it to be bigger\smaller or we should resacale it using the knowledge that we have (ASM and etc)
+Thanks!
+'''
 def show_fields_gif(fields, fps=2):
     """
     Show a sequence of 2D fields (real or complex) as an animation in the console.
