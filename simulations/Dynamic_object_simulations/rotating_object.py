@@ -8,18 +8,12 @@ from torchvision.transforms.functional import rotate
 from utils.io import load_file_to_tensor
 from utils.field_utils import generate_diffusers_and_PSFs
 from propagation.propagation import angular_spectrum_gpu
-from skimage.transform import warp_polar
-from skimage.registration import phase_cross_correlation
 from utils.image_processing import resize, center_crop, shift_cross_correlation, nrm
 from core.CTRCLASS import CTR_CLASS
 from utils.visualization import display_field, get_custom_colormap
 from torch.fft import fft2, ifft2, fftshift, ifftshift
-import numpy as np
 from skimage.transform import warp_polar
 from skimage.registration import phase_cross_correlation
-from scipy.ndimage import gaussian_laplace
-import torch
-from torchvision.transforms.functional import rotate
 
 
 
@@ -111,36 +105,6 @@ def show_fields_gif(fields, fps=2):
     plt.show()
 
 
-def estimate_rotation1(img1, img2):
-
-    # Convert to numpy if needed
-    if isinstance(img1, torch.Tensor):
-        img1 = img1.detach().cpu().numpy()
-    if isinstance(img2, torch.Tensor):
-        img2 = img2.detach().cpu().numpy()
-
-    # Convert complex inputs to magnitude
-    if np.iscomplexobj(img1):
-        img1 = np.abs(img1)
-    if np.iscomplexobj(img2):
-        img2 = np.abs(img2)
-
-    # Convert to log-polar coordinates
-    radius = min(img1.shape) // 2
-    precision = 0.1
-    angle_bins = int(1 / precision * 360)
-    logpolar1 = warp_polar(img1, radius=radius, output_shape=(angle_bins, 360))
-    logpolar2 = warp_polar(img2, radius=radius, output_shape=(angle_bins, 360))
-
-    # Use phase correlation to detect shift
-    shift, _, _ = phase_cross_correlation(logpolar1, logpolar2)
-
-    # Convert vertical shift to rotation angle
-    angle = (shift[0] / angle_bins) * 360
-    angle = angle % 360  # normalize to [0, 360)
-    return float(angle)
-
-
 def estimate_rotation(img1, img2, precision=0.05, use_phase=False, upsample_factor=100, normalize=True):
     """
     Estimate rotation angle between img1 and img2 using log-polar phase correlation.
@@ -200,11 +164,6 @@ def estimate_rotation(img1, img2, precision=0.05, use_phase=False, upsample_fact
         angle = angle % 360
 
     return float(angle)
-
-
-def preprocess_for_rotation(image, sigma=2):
-    """Apply LoG filtering to enhance angular features for rotation estimation."""
-    return gaussian_laplace(image, sigma=sigma)
 
 
 def estimate_rotation_gpu(ref, target, precision=0.5, similarity='correlation', expand=False):
@@ -322,14 +281,14 @@ for idx, angle in enumerate(angles):
     rotated_frame = rotate_field(padded_field,angle,expand=False)
     rotated_frames[idx] = rotated_frame
 
-show_fields_gif(rotated_frames, fps=30)
+# show_fields_gif(rotated_frames, fps=30)
 
 
 rotated_at_diffuser_plane = angular_spectrum_gpu(rotated_frames, pixel_size_m, wavelength_m, z_m)
 diffusers, PSFs = generate_diffusers_and_PSFs(padded_size,theta_deg,speckle_size_m,pixel_size_m, wavelength_m, M)
 distorted_at_diffuser_plane = diffusers.to(device) * rotated_at_diffuser_plane
 
-show_fields_gif(distorted_at_diffuser_plane, fps=30)
+# show_fields_gif(distorted_at_diffuser_plane, fps=30)
 
 aligned_distorted_at_diffuser_plane = torch.zeros((M, padded_size, padded_size), dtype=torch.complex64, device=device)
 reference_frame = torch.abs(distorted_at_diffuser_plane[0])
@@ -342,86 +301,94 @@ for idx in range(M):
     print(rotation_angle)
     aligned_frame = rotate_field(distorted_at_diffuser_plane[idx], -rotation_angle, expand=False)
     aligned_distorted_at_diffuser_plane[idx] = aligned_frame
-show_fields_gif(aligned_distorted_at_diffuser_plane, fps=30)
+# show_fields_gif(aligned_distorted_at_diffuser_plane, fps=30)
 
 
 cropping_size = diagonal
 cropped_aligned_distorted_at_diffuser_plane = center_crop(aligned_distorted_at_diffuser_plane, cropping_size)
-show_fields_gif(cropped_aligned_distorted_at_diffuser_plane, fps=30)
+cropped_distorted_at_diffuser_plane = center_crop(distorted_at_diffuser_plane, cropping_size)
+# show_fields_gif(cropped_aligned_distorted_at_diffuser_plane, fps=30)
 # Prepare for CLASS reconstruction
 T = torch.permute(cropped_aligned_distorted_at_diffuser_plane, [2, 1, 0]).reshape(cropping_size ** 2, -1)
+T_orig = torch.permute(cropped_distorted_at_diffuser_plane, [2, 1, 0]).reshape(cropping_size ** 2, -1)
 T = T.to(device)
+T_orig = T_orig.to(device)
 
 # Run CLASS algorithm
 _, _, phi_tot, MTF = CTR_CLASS(T, num_iters=1000)
+_, _, phi_tot_orig, MTF_orig = CTR_CLASS(T_orig, num_iters=1000)
 
 # _, PSF_std, obj_fourier_angle, obj_fourier_abs = CTR_CLASS(T, num_iters, imsize=shp)
 O_est_at_diff = torch.conj(phi_tot) * MTF
 O_est_0 = angular_spectrum_gpu(O_est_at_diff, pixel_size_m, wavelength_m, -z_m)
-
-z_values = np.linspace(0.5 * z_m, 2 * z_m, 100)
-propagated_Os = torch.zeros((100, cropping_size, cropping_size), dtype=torch.complex64, device=device)
-
-for idx, z_val in enumerate(z_values):
-    propagated_Os[idx] = angular_spectrum_gpu(O_est_at_diff, pixel_size_m, wavelength_m, -z_val)
-
-show_fields_gif(propagated_Os, 10)
-
-
-
 O_est = shift_cross_correlation(center_crop(widefield,cropping_size), O_est_0).cpu().numpy()
 O_est = O_est / np.abs(O_est).max()
+
+O_est_at_diff_orig = torch.conj(phi_tot_orig) * MTF_orig
+O_est_0_orig = angular_spectrum_gpu(O_est_at_diff_orig, pixel_size_m, wavelength_m, -z_m)
+O_est_orig = shift_cross_correlation(center_crop(widefield,cropping_size), O_est_0_orig).cpu().numpy()
+O_est_orig = O_est_orig / np.abs(O_est_orig).max()
+
 
 new_camp = get_custom_colormap()
 
 plt.figure()
 idx = M//3
-plt.subplot(251)
+plt.subplot(261)
 img = widefield.to(torch.complex64) if not torch.is_complex(widefield) else widefield
 img = img.cpu()
 plt.imshow(nrm(torch.abs(img)), cmap=new_camp, vmin=0, vmax=1)
 plt.title(f'widefield - magnitude')
 
-plt.subplot(256)
+plt.subplot(267)
 plt.imshow(torch.angle(img), cmap='hsv')
 plt.title(f'widfeield - Phase')
 
-plt.subplot(252)
+plt.subplot(262)
 img = diffusers[idx]
 img = img.cpu()
 plt.imshow(nrm(torch.abs(img)), cmap='gray', vmin=0, vmax=1)
 plt.title(f'diffuser - magnitude')
 
-plt.subplot(257)
+plt.subplot(268)
 plt.imshow(torch.angle(img), cmap='hsv')
 plt.title(f'diffuser - Phase')
 
-plt.subplot(253)
+plt.subplot(263)
 img = distorted_at_diffuser_plane[idx]
 img = img.cpu()
 plt.imshow(nrm(torch.abs(img)), cmap=new_camp, vmin=0, vmax=1)
 plt.title(f'distorted (at diff) - mag')
 
-plt.subplot(258)
+plt.subplot(269)
 plt.imshow(torch.angle(img), cmap='hsv')
 plt.title(f'distorted (at diff) - Phase')
 
-plt.subplot(254)
+plt.subplot(264)
 img = angular_spectrum_gpu(distorted_at_diffuser_plane[idx], pixel_size_m,wavelength_m, -z_m)
 img = img.cpu()
 plt.imshow(nrm(torch.abs(img)), cmap=new_camp, vmin=0, vmax=1)
 plt.title(f'distorted (at obj) - mag')
 
-plt.subplot(259)
+plt.subplot(2,6,10)
 plt.imshow(torch.angle(img), cmap='hsv')
 plt.title(f'distorted (at obj) - Phase')
 
-plt.subplot(255)
+plt.subplot(265)
+img = O_est_orig
+plt.imshow(nrm(np.abs(img)), cmap=new_camp, vmin=0, vmax=1)
+plt.title(f'reconstructed - mag')
+
+plt.subplot(2,6,11)
+plt.imshow(np.angle(img), cmap='hsv')
+plt.title(f'reconstructed - Phase')
+
+plt.subplot(266)
 img = O_est
 plt.imshow(nrm(np.abs(img)), cmap=new_camp, vmin=0, vmax=1)
 plt.title(f'reconstructed - mag')
 
-plt.subplot(2,5,10)
+plt.subplot(2,6,12)
 plt.imshow(np.angle(img), cmap='hsv')
 plt.title(f'reconstructed - Phase')
 
