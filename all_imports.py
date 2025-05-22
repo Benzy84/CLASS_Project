@@ -9,6 +9,7 @@ from utils.image_processing import fourier_convolution
 from utils.io import load_file_to_tensor
 from utils.image_processing import compute_similarity_score, shift_cross_correlation
 from propagation.propagation import angular_spectrum_gpu
+import imageio.v2 as imageio
 # Add other common imports
 
 # Create convenient aliases if needed

@@ -5,9 +5,14 @@ from scipy.signal import fftconvolve
 from torch.fft import fft2, fftshift, ifftshift, ifft2
 from torchvision.transforms import CenterCrop
 from utils.field_utils import gauss2D, circ
+from torchvision.transforms import CenterCrop, Resize
 
 nrm = lambda x: x/np.abs(x).max()
 
+
+def resize(img, desired_shp):
+    resize = Resize((desired_shp, desired_shp), antialias=True)
+    return resize(img.unsqueeze(0)).squeeze(0)
 
 
 def center_crop(image, crop_size):

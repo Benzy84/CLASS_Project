@@ -4,7 +4,6 @@ from torch.fft import *
 from scipy.special import jn
 import cv2
 from torchvision.datasets import CIFAR10
-from utils.image_processing import symmetric_pad_to_shape
 from scipy.signal import unit_impulse
 
 
@@ -132,6 +131,7 @@ def hypot_like(a):
     return torch.sqrt(x**2 + y**2)
 
 def getObject(obj_size,grid_size_px,name='Dog'):
+    from utils.image_processing import symmetric_pad_to_shape
     a = CIFAR10('..\CIFAR10', download=True)
     im = torch.DoubleTensor(np.array(a[4120][0].convert("L").resize((obj_size, obj_size))))
     if name in ['US', 'USAF']:
