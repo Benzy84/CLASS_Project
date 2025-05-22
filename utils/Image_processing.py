@@ -139,7 +139,7 @@ def imageMosaic(imlist):
     return im
 
 
-def shift_cross_correlation(dest, src):
+def shift_cross_correlation(dest, src, return_shift=False):
 
     device = src.device
     dest = dest.to(device)
@@ -199,7 +199,11 @@ def shift_cross_correlation(dest, src):
     src_shifted = torch.roll(src, shifts=(-max_loc[0].item(), -max_loc[1].item()), dims=(-2, -1))
     # display_field(src_shifted / src_shifted.abs().max() + dest / dest.abs().max())
 
-    return src_shifted
+    # Return based on the flag
+    if return_shift:
+        return src_shifted, max_loc
+    else:
+        return src_shifted
 
 
 def fourier_convolution(a, b, mode='same'):
