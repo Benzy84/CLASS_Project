@@ -18,21 +18,7 @@ from skimage.registration import phase_cross_correlation
 
 
 
-def rescale_complex_field(field, scale):
-    """Rescales a complex field by a given scale factor."""
-    return field * scale
-
-def find_best_scaling_by_intensity_alignment(field, ref_intensity, candidate_dz, size, pixel_size, wavelength):
-    """Find the best scaling factor and propagation distance for field alignment."""
-    field_intensity = torch.abs(field)**2
-    field_intensity_np = field_intensity.cpu().numpy()
-    
-    best_score = -np.inf
-    best_scale = 1.0
-    best_dz = 0.0
-    
-    for dz in candidate_dz:
-        # Estimate scale using intensity ratio
+def show_fields_gif(fields, fps=2):
     """
     Show a sequence of 2D fields (real or complex) as an animation in the console.
 
@@ -77,6 +63,110 @@ def find_best_scaling_by_intensity_alignment(field, ref_intensity, candidate_dz,
     plt.show()
 
 
+def find_best_scale_from_intensities(field_intensity, ref_intensity, scale_range=(0.8, 1.2), num_scales=100):
+    """
+    Find the best zoom scale by comparing intensities only.
+
+    Parameters:
+    -----------
+    field_intensity : torch.Tensor (real)
+        Intensity of field to scale (|field|²)
+    ref_intensity : torch.Tensor (real)
+        Reference intensity to match
+
+    Returns:
+    --------
+    best_scale : float
+        Optimal zoom factor
+    """
+    h, w = field_intensity.shape
+    scales = torch.linspace(scale_range[0], scale_range[1], num_scales)
+    best_score = -float('inf')
+    best_scale = 1.0
+
+    for scale in scales:
+        scale_float = scale.item()  # Convert tensor to float
+
+        if scale_float == 1.0:
+            scaled_intensity = field_intensity
+        else:
+            # Zoom the intensity image
+            scaled_intensity = torch.nn.functional.interpolate(
+                field_intensity.unsqueeze(0).unsqueeze(0),
+                scale_factor=scale_float,  # Use the float value
+                mode='bilinear',
+                align_corners=False
+            ).squeeze()
+
+            # Crop or pad to original size
+            if scale_float > 1.0:
+                # Crop center
+                sh, sw = scaled_intensity.shape
+                start_h = (sh - h) // 2
+                start_w = (sw - w) // 2
+                scaled_intensity = scaled_intensity[start_h:start_h + h, start_w:start_w + w]
+            else:
+                # Pad
+                sh, sw = scaled_intensity.shape
+                pad_h = (h - sh) // 2
+                pad_w = (w - sw) // 2
+                scaled_intensity = torch.nn.functional.pad(
+                    scaled_intensity,
+                    (pad_w, w - sw - pad_w, pad_h, h - sh - pad_h)
+                )
+
+        # Use your similarity function
+        score = compute_similarity_score(scaled_intensity, ref_intensity)
+
+        if score > best_score:
+            best_score = score
+            best_scale = scale_float  # Store as float
+
+    return best_scale
+
+
+def apply_zoom_to_complex_field(field, scale):
+    """
+    Apply zoom to a complex field by processing real and imaginary parts separately.
+    """
+    if scale == 1.0:
+        return field
+
+    h, w = field.shape
+
+    # Split and zoom
+    real_zoomed = torch.nn.functional.interpolate(
+        field.real.unsqueeze(0).unsqueeze(0),
+        scale_factor=float(scale),  # Ensure it's a float
+        mode='bilinear',
+        align_corners=False
+    ).squeeze()
+
+    imag_zoomed = torch.nn.functional.interpolate(
+        field.imag.unsqueeze(0).unsqueeze(0),
+        scale_factor=float(scale),  # Ensure it's a float
+        mode='bilinear',
+        align_corners=False
+    ).squeeze()
+
+    zoomed = real_zoomed + 1j * imag_zoomed
+
+    # Crop or pad
+    if scale > 1.0:
+        sh, sw = zoomed.shape
+        start_h = (sh - h) // 2
+        start_w = (sw - w) // 2
+        return zoomed[start_h:start_h + h, start_w:start_w + w]
+    else:
+        sh, sw = zoomed.shape
+        pad_h = (h - sh) // 2
+        pad_w = (w - sw) // 2
+        return torch.nn.functional.pad(
+            zoomed,
+            (pad_w, w - sw - pad_w, pad_h, h - sh - pad_h)
+        )
+
+
 
 # parameters
 obj_size = 80
@@ -84,7 +174,7 @@ pixel_size_m = 5e-6
 speckle_size_m = 15e-6  # Speckle size in meters
 wavelength_m = 0.6328e-6 # (632.8 nm)
 theta_deg = 0.5
-M = 180  # Number of realizations
+M = 200  # Number of realizations
 z_m = 4e-2
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -125,7 +215,7 @@ for idx in range(M):
 # plt.subplot(122)
 # plt.imshow(img2)
 # plt.show()
-# show_fields_gif(shifted_frames, fps=40)
+# show_fields_gif(shifted_frames, fps=4)
 # show_fields_gif(fftshift(fft2(shifted_frames)), fps=3)
 
 
@@ -135,46 +225,37 @@ distorted_at_diffuser_plane = diffusers.to(device) * shifted_at_diffuser_plane
 #
 # show_fields_gif(distorted_at_diffuser_plane, fps=20)
 #
+
+# Replace your existing loop (lines around 220-230) with:
+# After getting distorted_at_diffuser_plane...
+
 aligned_distorted_at_diffuser_plane = torch.zeros((M, padded_size, padded_size), dtype=torch.complex64, device=device)
+aligned_distorted_at_diffuser_plane[0] = distorted_at_diffuser_plane[0]
 
-# Define candidate ∆z range to scan (in meters)
-candidate_dz = np.linspace(-1e-2, 1e-2, 201)  # e.g., -1 cm to +1 cm, 0.1 mm steps
+# Reference intensity
+ref_intensity = torch.abs(distorted_at_diffuser_plane[0]) ** 2
 
-ref_intensity = torch.abs(distorted_at_diffuser_plane[0])**2
-ref_intensity_np = ref_intensity.cpu().numpy()
+for idx in range(1, M):
+    # Get current intensity
+    current_intensity = torch.abs(distorted_at_diffuser_plane[idx]) ** 2
 
-for idx in range(M):
-    field = distorted_at_diffuser_plane[idx]
-    best_scale, best_dz = find_best_scaling_by_intensity_alignment(
-        field, ref_intensity_np, candidate_dz, padded_size, pixel_size_m, wavelength_m
+    # Find best scale using ONLY intensities
+    best_scale = find_best_scale_from_intensities(
+        current_intensity,
+        ref_intensity,
+        scale_range=(0.8, 1.2),  # Adjust based on your expected z-range
+        num_scales=100
+    )
+    # Apply the zoom to the complex field
+    aligned_field = apply_zoom_to_complex_field(
+        distorted_at_diffuser_plane[idx],
+        best_scale
     )
 
-    scaled_field = rescale_complex_field(field, best_scale)
-    aligned_distorted_at_diffuser_plane[idx] = scaled_field
+    aligned_distorted_at_diffuser_plane[idx] = aligned_field
+    print(f"Frame {idx}/{M}: best scale = {best_scale:.4f}")
 
-    print(f"Frame {idx:3d}: best ∆z = {best_dz*1e3:+.2f} mm, scale = {best_scale:.5f}")
-
-
-reference_frame = torch.abs(distorted_at_diffuser_plane[0])
-# Reference intensity for scale estimation
-reference_intensity = torch.abs(distorted_at_diffuser_plane[0]).cpu().numpy()
-
-for idx in range(M):
-    current_field = distorted_at_diffuser_plane[idx]
-    current_intensity = torch.abs(current_field).cpu().numpy()
-
-    # Estimate relative scale w.r.t. frame 0
-    
-
-    # Apply scaling to the complex field
-    # scaled_field = ...
-
-    aligned_distorted_at_diffuser_plane[idx] = scaled_field
-
-    print(f"Frame {idx}: estimated scale = {scale:.5f}")
-
-
-show_fields_gif(aligned_distorted_at_diffuser_plane, fps=10)
+# show_fields_gif(aligned_distorted_at_diffuser_plane, fps=4)
 
 
 cropping_size = padded_size
@@ -182,7 +263,7 @@ cropped_aligned_distorted_at_diffuser_plane = center_crop(aligned_distorted_at_d
 cropped_distorted_at_diffuser_plane = center_crop(distorted_at_diffuser_plane, cropping_size)
 # show_fields_gif(cropped_aligned_distorted_at_diffuser_plane, fps=30)
 # Prepare for CLASS reconstruction
-T = torch.permute(distorted_at_diffuser_plane, [2, 1, 0]).reshape(cropping_size ** 2, -1)
+T = torch.permute(cropped_aligned_distorted_at_diffuser_plane, [2, 1, 0]).reshape(cropping_size ** 2, -1)
 T_orig = torch.permute(cropped_distorted_at_diffuser_plane, [2, 1, 0]).reshape(cropping_size ** 2, -1)
 T = T.to(device)
 T_orig = T_orig.to(device)
@@ -205,7 +286,7 @@ z_values = np.linspace(0.5 * z_m, 2 * z_m, 100)
 propagated_Os = torch.zeros((100, cropping_size, cropping_size), dtype=torch.complex64, device=device)
 std = 0
 for idx, z_val in enumerate(z_values):
-    propagated_Os[idx] = angular_spectrum_gpu(O_est_at_diff, pixel_size_m, wavelength_m, -z_val)
+    propagated_Os[idx] = angular_spectrum_gpu(O_est_at_diff_orig, pixel_size_m, wavelength_m, -z_val)
     if torch.std((propagated_Os[idx])) > std:
         std = torch.std((propagated_Os[idx]))
         best_idx = idx
