@@ -187,45 +187,53 @@ def fourier_domain_scaling(field, scale_factor):
     return ifft2(ifftshift(F_scaled))
 
 
-def find_scale_via_radial_profile(field_intensity, ref_intensity, scale_range=(0.8, 1.2), num_scales=100):
+def find_scale_via_radial_profile(field_intensity, ref_intensity, scale_range=(0.8, 1.2), num_scales=50):
     """
-    Find scaling by matching radial profiles in Fourier domain.
-    This is more robust for speckle patterns.
+    GPU-accelerated radial profile matching for scaling.
+    Reduced num_scales for speed.
     """
 
-    def get_radial_profile(intensity):
+    def get_radial_profile_gpu(intensity):
         # FFT of intensity
         F = fftshift(fft2(intensity))
         magnitude = torch.log(torch.abs(F) + 1)
 
         h, w = magnitude.shape
-        center = (h // 2, w // 2)
+        center_h, center_w = h // 2, w // 2
 
-        # Create radial coordinate
-        y, x = torch.meshgrid(torch.arange(h, device=intensity.device),
-                              torch.arange(w, device=intensity.device), indexing='ij')
-        r = torch.sqrt((x - center[1]) ** 2 + (y - center[0]) ** 2)
+        # Create radial coordinate grid (vectorized)
+        y = torch.arange(h, device=intensity.device, dtype=torch.float32) - center_h
+        x = torch.arange(w, device=intensity.device, dtype=torch.float32) - center_w
+        Y, X = torch.meshgrid(y, x, indexing='ij')
+        r = torch.sqrt(X ** 2 + Y ** 2)
 
-        # Bin into radial profile
-        max_r = int(r.max().item())
+        # Vectorized binning using scatter_add
+        max_r = min(int(r.max().item()), min(h, w) // 2)  # Limit max radius
+        r_int = torch.clamp(r.long(), 0, max_r - 1)
+
         profile = torch.zeros(max_r, device=intensity.device)
+        counts = torch.zeros(max_r, device=intensity.device)
 
-        for i in range(max_r):
-            mask = (r >= i) & (r < i + 1)
-            if mask.any():
-                profile[i] = magnitude[mask].mean()
+        # Use scatter_add for GPU-accelerated binning
+        profile.scatter_add_(0, r_int.flatten(), magnitude.flatten())
+        counts.scatter_add_(0, r_int.flatten(), torch.ones_like(magnitude.flatten()))
 
-        return profile
+        # Average (avoid division by zero)
+        profile = profile / (counts + 1e-8)
 
-    ref_profile = get_radial_profile(ref_intensity)
+        return profile[:max_r // 2]  # Use only first half for speed
+
+    ref_profile = get_radial_profile_gpu(ref_intensity)
 
     scales = torch.linspace(scale_range[0], scale_range[1], num_scales, device=field_intensity.device)
-    best_score = -float('inf')
-    best_scale = 1.0
+    scores = torch.zeros(num_scales, device=field_intensity.device)
 
-    for scale in scales:
-        # Scale the intensity and get its profile
-        if scale != 1.0:
+    # Vectorized scaling and comparison
+    for i, scale in enumerate(scales):
+        if abs(scale - 1.0) < 1e-6:
+            scaled_intensity = field_intensity
+        else:
+            # Scale the intensity
             scaled_intensity = F.interpolate(
                 field_intensity.unsqueeze(0).unsqueeze(0),
                 scale_factor=scale.item(),
@@ -233,24 +241,22 @@ def find_scale_via_radial_profile(field_intensity, ref_intensity, scale_range=(0
                 align_corners=False
             ).squeeze()
 
-            # Crop/pad to match size
+            # Crop/pad to match size (optimized)
             h, w = ref_intensity.shape
+            sh, sw = scaled_intensity.shape
+
             if scale > 1.0:
-                sh, sw = scaled_intensity.shape
                 start_h, start_w = (sh - h) // 2, (sw - w) // 2
                 scaled_intensity = scaled_intensity[start_h:start_h + h, start_w:start_w + w]
             else:
-                sh, sw = scaled_intensity.shape
                 pad_h, pad_w = (h - sh) // 2, (w - sw) // 2
                 scaled_intensity = F.pad(scaled_intensity, (pad_w, w - sw - pad_w, pad_h, h - sh - pad_h))
-        else:
-            scaled_intensity = field_intensity
 
-        field_profile = get_radial_profile(scaled_intensity)
+        field_profile = get_radial_profile_gpu(scaled_intensity)
 
-        # Compare profiles (use shorter length)
+        # Compare profiles
         min_len = min(len(ref_profile), len(field_profile))
-        if min_len > 10:  # Need enough points
+        if min_len > 5:
             ref_norm = ref_profile[:min_len]
             field_norm = field_profile[:min_len]
 
@@ -259,13 +265,10 @@ def find_scale_via_radial_profile(field_intensity, ref_intensity, scale_range=(0
             field_norm = field_norm / (torch.norm(field_norm) + 1e-8)
 
             # Correlation score
-            score = torch.dot(ref_norm, field_norm).item()
+            scores[i] = torch.dot(ref_norm, field_norm)
 
-            if score > best_score:
-                best_score = score
-                best_scale = scale.item()
-
-    return best_scale
+    best_idx = torch.argmax(scores)
+    return scales[best_idx].item()
 
 
 def physics_constrained_scaling(z_nominal, z_range, field_intensity, ref_intensity):
@@ -387,7 +390,7 @@ def multi_metric_scaling(field, ref_intensity, z_nominal=None, z_range=None):
 
 def enhanced_field_alignment(distorted_fields, z_nominal, z_range):
     """
-    Enhanced alignment using multiple methods.
+    Enhanced alignment using multiple methods - GPU accelerated.
 
     Parameters:
     -----------
@@ -404,27 +407,41 @@ def enhanced_field_alignment(distorted_fields, z_nominal, z_range):
         Aligned complex fields
     """
     M = distorted_fields.shape[0]
+    device = distorted_fields.device
     aligned_fields = torch.zeros_like(distorted_fields)
 
     # Use first frame as reference
     aligned_fields[0] = distorted_fields[0]
     ref_intensity = torch.abs(distorted_fields[0]) ** 2
 
-    print("Aligning fields using enhanced multi-metric approach...")
+    print("Aligning fields using GPU-accelerated approach...")
 
-    for idx in range(1, M):
-        current_field = distorted_fields[idx]
+    # Process in smaller batches for GPU memory efficiency
+    batch_size = min(10, M - 1)
 
-        # Find best scale using multiple metrics
-        best_scale = multi_metric_scaling(
-            current_field, ref_intensity, z_nominal, z_range
-        )
+    for start_idx in range(1, M, batch_size):
+        end_idx = min(start_idx + batch_size, M)
 
-        # Apply scaling in spatial domain (more reliable)
-        aligned_field = apply_zoom_to_complex_field(current_field, best_scale)
+        for idx in range(start_idx, end_idx):
+            current_field = distorted_fields[idx]
 
-        aligned_fields[idx] = aligned_field
-        print(f"Frame {idx}/{M}: scale = {best_scale:.4f}")
+            # Find best scale using GPU-accelerated radial profile
+            current_intensity = torch.abs(current_field) ** 2
+            best_scale = find_scale_via_radial_profile(
+                current_intensity, ref_intensity,
+                scale_range=(0.85, 1.15),  # Reduced range for speed
+                num_scales=30  # Reduced for speed
+            )
+
+            # Apply scaling in spatial domain (more reliable)
+            aligned_field = apply_zoom_to_complex_field(current_field, best_scale)
+            aligned_fields[idx] = aligned_field
+
+            if idx % 20 == 0:  # Less frequent printing
+                print(f"Frame {idx}/{M}: scale = {best_scale:.4f}")
+
+        # Clear GPU cache periodically
+        torch.cuda.empty_cache()
 
     return aligned_fields
 
@@ -496,6 +513,11 @@ def apply_zoom_to_complex_field(field, scale):
         pad_w_after = w - sw - pad_w
 
         return F.pad(zoomed, (pad_w, pad_w_after, pad_h, pad_h_after))
+
+
+
+
+
 
 # parameters
 obj_size = 130
