@@ -75,6 +75,253 @@ def show_fields_gif(fields, fps=2):
     plt.show()
 
 
+def estimate_z_distance_from_fresnel_fringes(field_intensity, reference_intensity,
+                                             z_nominal, wavelength, pixel_size,
+                                             z_search_range=1e-2, num_z_samples=50):
+    """
+    Estimate relative z-distance by analyzing Fresnel fringe patterns.
+    GPU-accelerated version.
+
+    Parameters:
+    -----------
+    field_intensity : torch.Tensor (H, W)
+        Intensity pattern to analyze
+    reference_intensity : torch.Tensor (H, W)
+        Reference intensity pattern (at known z_nominal)
+    z_nominal : float
+        Reference z-distance in meters
+    wavelength : float
+        Wavelength in meters
+    pixel_size : float
+        Pixel size in meters
+    z_search_range : float
+        Search range around z_nominal (±z_search_range)
+    num_z_samples : int
+        Number of z-distances to test
+
+    Returns:
+    --------
+    float : estimated z-distance
+    """
+    device = field_intensity.device
+
+    # Create z-distance candidates
+    z_min = z_nominal - z_search_range / 2
+    z_max = z_nominal + z_search_range / 2
+    z_candidates = torch.linspace(z_min, z_max, num_z_samples, device=device)
+
+    def get_edge_fringe_signature(intensity):
+        """Extract Fresnel fringe characteristics around edges"""
+        # GPU-accelerated edge detection
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                               dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                               dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+
+        # Apply edge detection
+        intensity_padded = intensity.unsqueeze(0).unsqueeze(0)
+        edges_x = F.conv2d(intensity_padded, sobel_x, padding=1).squeeze()
+        edges_y = F.conv2d(intensity_padded, sobel_y, padding=1).squeeze()
+        edge_magnitude = torch.sqrt(edges_x ** 2 + edges_y ** 2)
+
+        # Find strong edges
+        edge_threshold = torch.quantile(edge_magnitude, 0.9)
+        strong_edges = edge_magnitude > edge_threshold
+
+        # Get autocorrelation near edges to measure fringe spacing
+        edge_region = intensity * strong_edges.float()
+
+        # Compute local autocorrelation (FFT-based for speed)
+        if edge_region.sum() > 0:
+            autocorr = ifft2(torch.abs(fft2(edge_region)) ** 2).real
+            autocorr = fftshift(autocorr)
+
+            # Extract central profile to measure characteristic length
+            center = autocorr.shape[0] // 2
+            profile = autocorr[center, :]
+
+            # Find first minimum (characteristic fringe spacing)
+            center_idx = len(profile) // 2
+            profile_half = profile[center_idx:]
+
+            # Smooth profile for stable minimum detection
+            if len(profile_half) > 10:
+                kernel = torch.ones(5, device=device) / 5
+                profile_smooth = F.conv1d(profile_half.unsqueeze(0).unsqueeze(0),
+                                          kernel.unsqueeze(0).unsqueeze(0),
+                                          padding=2).squeeze()
+
+                # Find first local minimum
+                for i in range(2, len(profile_smooth) - 2):
+                    if (profile_smooth[i] < profile_smooth[i - 1] and
+                            profile_smooth[i] < profile_smooth[i + 1] and
+                            profile_smooth[i] < 0.5 * profile_smooth[0]):
+                        return float(i)
+
+        return 10.0  # Default value if no good minimum found
+
+    # Get reference fringe signature
+    ref_signature = get_edge_fringe_signature(reference_intensity)
+
+    # Test all z-candidates
+    best_score = -float('inf')
+    best_z = z_nominal
+
+    for z_test in z_candidates:
+        # Simulate what the pattern would look like at z_test
+        magnification = z_test / z_nominal
+
+        # Apply magnification to create synthetic pattern
+        if abs(magnification - 1.0) > 1e-6:
+            synthetic_intensity = F.interpolate(
+                field_intensity.unsqueeze(0).unsqueeze(0),
+                scale_factor=float(magnification),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze()
+
+            # Crop/pad to match size
+            h, w = reference_intensity.shape
+            if magnification > 1.0:
+                sh, sw = synthetic_intensity.shape
+                start_h, start_w = (sh - h) // 2, (sw - w) // 2
+                synthetic_intensity = synthetic_intensity[start_h:start_h + h, start_w:start_w + w]
+            else:
+                sh, sw = synthetic_intensity.shape
+                pad_h, pad_w = (h - sh) // 2, (w - sw) // 2
+                synthetic_intensity = F.pad(synthetic_intensity,
+                                            (pad_w, w - sw - pad_w, pad_h, h - sh - pad_h))
+        else:
+            synthetic_intensity = field_intensity
+
+        # Get fringe signature for this z
+        test_signature = get_edge_fringe_signature(synthetic_intensity)
+
+        # Score based on how well fringe signatures match
+        # Fresnel fringes scale as sqrt(z), so we expect:
+        expected_signature_ratio = torch.sqrt(z_test / z_nominal)
+        actual_signature_ratio = test_signature / ref_signature
+
+        score = -torch.abs(actual_signature_ratio - expected_signature_ratio)
+
+        if score > best_score:
+            best_score = score
+            best_z = z_test.item()
+
+    return best_z
+
+
+def apply_physics_based_z_correction(field, z_actual, z_reference, wavelength, pixel_size):
+    """
+    Apply ONLY geometric correction based on z-distance ratio.
+    Let CLASS handle all phase/diffraction complexities.
+
+    Parameters:
+    -----------
+    field : torch.Tensor (H, W)
+        Complex field to correct
+    z_actual : float
+        Actual z-distance where field was acquired
+    z_reference : float
+        Target z-distance to simulate
+    wavelength : float
+        Wavelength in meters (not used, kept for compatibility)
+    pixel_size : float
+        Pixel size in meters (not used, kept for compatibility)
+
+    Returns:
+    --------
+    torch.Tensor : corrected complex field
+    """
+    if abs(z_actual - z_reference) < 1e-6:
+        return field
+
+    # Only geometric scaling - magnification correction
+    geometric_scale = z_reference / z_actual
+
+    if abs(geometric_scale - 1.0) < 1e-6:
+        return field
+
+    # Use the existing apply_zoom_to_complex_field function
+    # (This should already be defined in your code)
+    return apply_zoom_to_complex_field(field, geometric_scale)
+
+
+def physics_z_alignment_method(distorted_fields, z_nominal, wavelength, pixel_size, z_search_range=1e-2):
+    """
+    Method C: Physics-based z-distance correction.
+
+    Parameters:
+    -----------
+    distorted_fields : torch.Tensor (M, H, W)
+        Complex fields at diffuser plane
+    z_nominal : float
+        Reference z-distance
+    wavelength : float
+        Wavelength in meters
+    pixel_size : float
+        Pixel size in meters
+    z_search_range : float
+        Expected range of z-variations
+
+    Returns:
+    --------
+    torch.Tensor : aligned complex fields
+    """
+    M = distorted_fields.shape[0]
+    device = distorted_fields.device
+    aligned_fields = torch.zeros_like(distorted_fields)
+
+    # Use first frame as reference
+    aligned_fields[0] = distorted_fields[0]
+    ref_intensity = torch.abs(distorted_fields[0]) ** 2
+
+    print("Method C: Physics-based z-distance alignment...")
+
+    # Estimate z-distances for all frames
+    z_distances = torch.zeros(M, device=device)
+    z_distances[0] = z_nominal  # Reference frame
+
+    # Process in batches for memory efficiency
+    batch_size = min(20, M - 1)
+
+    for start_idx in range(1, M, batch_size):
+        end_idx = min(start_idx + batch_size, M)
+
+        for idx in range(start_idx, end_idx):
+            current_field = distorted_fields[idx]
+            current_intensity = torch.abs(current_field) ** 2
+
+            # Estimate z-distance using Fresnel fringe analysis
+            estimated_z = estimate_z_distance_from_fresnel_fringes(
+                current_intensity, ref_intensity, z_nominal,
+                wavelength, pixel_size, z_search_range
+            )
+
+            z_distances[idx] = estimated_z
+
+            # Apply physics-based correction
+            corrected_field = apply_physics_based_z_correction(
+                current_field, estimated_z, z_nominal, wavelength, pixel_size
+            )
+
+            aligned_fields[idx] = corrected_field
+
+            if idx % 20 == 0:
+                print(f"Frame {idx}/{M}: estimated z = {estimated_z * 1000:.2f}mm, "
+                      f"reference z = {z_nominal * 1000:.2f}mm")
+
+        # Clear GPU cache periodically
+        torch.cuda.empty_cache()
+
+    # Print summary statistics
+    z_mean = z_distances.mean().item()
+    z_std = z_distances.std().item()
+    print(f"Z-distance statistics: mean = {z_mean * 1000:.2f}mm, std = {z_std * 1000:.2f}mm")
+
+    return aligned_fields
+
+
 def find_best_scale_from_intensities(field_intensity, ref_intensity, scale_range=(0.8, 1.2), num_scales=100):
     """
     Find the best zoom scale by comparing intensities only.
@@ -546,7 +793,7 @@ clean_diffuser, clean_PSF = generate_diffusers_and_PSFs(padded_size, 0 ,speckle_
 image_at_diffuser_plane = angular_spectrum_gpu(padded_field, pixel_size_m, wavelength_m, z_m) * clean_diffuser.to(device)
 widefield = angular_spectrum_gpu(image_at_diffuser_plane, pixel_size_m, wavelength_m, -z_m)
 
-shifts_z = np.random.uniform(-0.5e-2, 0.5e-2, size=M)
+shifts_z = np.random.uniform(-1/20 * z_m, 1/20 * z_m, size=M)
 
 shifts_z[0] = 0
 print(f"X range:  {100 *shifts_z.min()} to {100 * shifts_z.max()} cm")
@@ -592,6 +839,14 @@ aligned_distorted_at_diffuser_plane = enhanced_field_alignment(
     z_range=1e-2  # Expected range of z variations (1 cm)
 )
 
+# Method C: Physics-based z-distance correction
+aligned_distorted_at_diffuser_plane_c = physics_z_alignment_method(
+    distorted_at_diffuser_plane,
+    z_nominal=z_m,  # Your nominal z distance
+    wavelength=wavelength_m,
+    pixel_size=pixel_size_m,
+    z_search_range=1e-2  # Expected range of z variations (1 cm)
+)
 # Method 2: If you know the actual z_shifts (MOST ACCURATE)
 # aligned_distorted_at_diffuser_plane = physics_based_correction(
 #     distorted_at_diffuser_plane,
@@ -635,29 +890,33 @@ print("Enhanced alignment complete!")
 # Continue with your existing code...
 
 
-# show_fields_gif(aligned_distorted_at_diffuser_plane, fps=2)
+# show_fields_gif(((aligned_distorted_at_diffuser_plane_b)), fps=10)
 
 
 cropping_size = padded_size
 cropped_aligned_distorted_at_diffuser_plane = center_crop(aligned_distorted_at_diffuser_plane, cropping_size)
 cropped_aligned_distorted_at_diffuser_plane_a = center_crop(aligned_distorted_at_diffuser_plane_a, cropping_size)
 cropped_aligned_distorted_at_diffuser_plane_b = center_crop(aligned_distorted_at_diffuser_plane_b, cropping_size)
+cropped_aligned_distorted_at_diffuser_plane_c = center_crop(aligned_distorted_at_diffuser_plane_c, cropping_size)
 cropped_distorted_at_diffuser_plane = center_crop(distorted_at_diffuser_plane, cropping_size)
 # show_fields_gif(cropped_aligned_distorted_at_diffuser_plane, fps=30)
 # Prepare for CLASS reconstruction
 T = torch.permute(cropped_aligned_distorted_at_diffuser_plane, [2, 1, 0]).reshape(cropping_size ** 2, -1)
 T_a = torch.permute(cropped_aligned_distorted_at_diffuser_plane_a, [2, 1, 0]).reshape(cropping_size ** 2, -1)
 T_b = torch.permute(cropped_aligned_distorted_at_diffuser_plane_b, [2, 1, 0]).reshape(cropping_size ** 2, -1)
+T_c = torch.permute(cropped_aligned_distorted_at_diffuser_plane_c, [2, 1, 0]).reshape(cropping_size ** 2, -1)
 T_orig = torch.permute(cropped_distorted_at_diffuser_plane, [2, 1, 0]).reshape(cropping_size ** 2, -1)
 T = T.to(device)
 T_a = T_a.to(device)
 T_b = T_b.to(device)
+T_c = T_c.to(device)
 T_orig = T_orig.to(device)
 
 # Run CLASS algorithm
 _, _, phi_tot, MTF = CTR_CLASS(T, num_iters=1000)
 _, _, phi_tot_a, MTF_a = CTR_CLASS(T_a, num_iters=1000)
 _, _, phi_tot_b, MTF_b = CTR_CLASS(T_b, num_iters=1000)
+_, _, phi_tot_c, MTF_c = CTR_CLASS(T_c, num_iters=1000)
 _, _, phi_tot_orig, MTF_orig = CTR_CLASS(T_orig, num_iters=1000)
 
 O_est_at_diff = torch.conj(phi_tot) * MTF
@@ -674,6 +933,11 @@ O_est_at_diff_b = torch.conj(phi_tot_b) * MTF_b
 O_est_0_b = angular_spectrum_gpu(O_est_at_diff_b, pixel_size_m, wavelength_m, -z_m)
 O_est_b = shift_cross_correlation(center_crop(widefield,cropping_size), O_est_0_b).cpu().numpy()
 O_est_b = O_est_b / np.abs(O_est_b).max()
+
+O_est_at_diff_c = torch.conj(phi_tot_c) * MTF_c
+O_est_0_c = angular_spectrum_gpu(O_est_at_diff_c, pixel_size_m, wavelength_m, -z_m)
+O_est_c = shift_cross_correlation(center_crop(widefield,cropping_size), O_est_0_c).cpu().numpy()
+O_est_c = O_est_c / np.abs(O_est_c).max()
 
 O_est_at_diff_orig = torch.conj(phi_tot_orig) * MTF_orig
 O_est_0_orig = angular_spectrum_gpu(O_est_at_diff_orig, pixel_size_m, wavelength_m, -z_m)
@@ -710,12 +974,12 @@ plt.title(f'widfeield - Phase')
 
 plt.subplot(262)
 img = diffusers[idx]
-img = img.cpu()
-plt.imshow(nrm(torch.abs(img)), cmap='gray', vmin=0, vmax=1)
+img = O_est_c
+plt.imshow(nrm(np.abs(img)), cmap=new_camp, vmin=0, vmax=1)
 plt.title(f'diffuser - magnitude')
 
 plt.subplot(268)
-plt.imshow(torch.angle(img), cmap='hsv')
+plt.imshow(np.angle(img), cmap='hsv')
 plt.title(f'diffuser - Phase')
 
 plt.subplot(263)

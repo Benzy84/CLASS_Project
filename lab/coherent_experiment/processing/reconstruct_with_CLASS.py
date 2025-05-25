@@ -246,20 +246,20 @@ Icam = Icam.to(torch.complex64)
 T = torch.permute((Icam), [2, 1, 0]).reshape(np.prod(shp), -1)
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-_, PSF_std, obj_fourier_angle, obj_fourier_abs = CTR_CLASS(T, num_iters,imsize=shp)
+_, _, obj_fourier_angle, obj_fourier_abs = CTR_CLASS(T, num_iters,imsize=shp)
 O_est = torch.conj(obj_fourier_angle) * obj_fourier_abs
-PSF_std = fftshift(PSF_std)
+# PSF_std = fftshift(PSF_std)
 # O_est = fftshift(ifft2(fftshift(field)))
 # O_est = fftshift(fft2((O_est)))
 # O_est = ifft2(fftshift(fft2(O_est)))
-
-plt.figure()
-plt.imshow(np.abs(PSF_std))
-plt.show(block=False)
-plt.figure()
-plt.imshow(O_est.abs())
-plt.title('O_est')
-plt.show(block=False)
+#
+# plt.figure()
+# plt.imshow(np.abs(PSF_std))
+# plt.show(block=False)
+# plt.figure()
+# plt.imshow(O_est.abs())
+# plt.title('O_est')
+# plt.show(block=False)
 
 O_est_numpy = O_est.numpy()
 # Determine if the fields are from 'original_fields' or 'normalized_original_fields'
