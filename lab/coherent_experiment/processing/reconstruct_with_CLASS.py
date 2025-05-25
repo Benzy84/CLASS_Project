@@ -261,7 +261,7 @@ O_est = torch.conj(obj_fourier_angle) * obj_fourier_abs
 # plt.title('O_est')
 # plt.show(block=False)
 
-O_est_numpy = O_est.numpy()
+O_est_numpy = O_est.cpu().numpy()
 # Determine if the fields are from 'original_fields' or 'normalized_original_fields'
 field_source = 'norm' if 'normalized_original_fields' in pth else 'original'
 # Create the base filename
@@ -278,21 +278,21 @@ file_path = os.path.join(saving_pth, name_of_file)
 # Save the file
 np.save(file_path, O_est_numpy)
 print(f"File saved successfully at: {file_path}")
-
-
-mxidx_psf = np.unravel_index(torch.argmax(PSF_std.abs()),PSF_std.shape)
-# Calculate the shifts needed to center the PSF
-shift_cols_psf = PSF_std.shape[1] // 2 - mxidx_psf[1].item()
-shift_rows_psf = PSF_std.shape[0] // 2 - mxidx_psf[0].item()
-# shift_cols_psf = PSF.shape[1] // 2 - 106
-# shift_rows_psf = PSF.shape[1] // 2 - 128
-# Shift the PSF to center it
-psf_centered = torch.roll(PSF_std, shifts=(shift_rows_psf, shift_cols_psf), dims=(0, 1))
-plt.figure()
-plt.imshow(np.abs(psf_centered))
-plt.show()
-file_path = os.path.join(saving_pth, 'psf_centered')
-np.save(file_path, psf_centered)
+#
+#
+# mxidx_psf = np.unravel_index(torch.argmax(PSF_std.abs()),PSF_std.shape)
+# # Calculate the shifts needed to center the PSF
+# shift_cols_psf = PSF_std.shape[1] // 2 - mxidx_psf[1].item()
+# shift_rows_psf = PSF_std.shape[0] // 2 - mxidx_psf[0].item()
+# # shift_cols_psf = PSF.shape[1] // 2 - 106
+# # shift_rows_psf = PSF.shape[1] // 2 - 128
+# # Shift the PSF to center it
+# psf_centered = torch.roll(PSF_std, shifts=(shift_rows_psf, shift_cols_psf), dims=(0, 1))
+# plt.figure()
+# plt.imshow(np.abs(psf_centered))
+# plt.show()
+# file_path = os.path.join(saving_pth, 'psf_centered')
+# np.save(file_path, psf_centered)
 
 #
 # O_est_centered = torch.roll(O_est, shifts=(shift_rows_psf, shift_cols_psf), dims=(0, 1))
